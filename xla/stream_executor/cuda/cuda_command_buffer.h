@@ -34,6 +34,7 @@ limitations under the License.
 #include "xla/stream_executor/bit_pattern.h"
 #include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/cuda/cuda_context.h"
+#include "xla/stream_executor/cuda/cuda_graph_annotation_registry.h"
 #include "xla/stream_executor/device_address.h"
 #include "xla/stream_executor/dnn.h"
 #include "xla/stream_executor/gpu/gpu_command_buffer.h"
@@ -43,6 +44,10 @@ limitations under the License.
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
+
+#if CUDA_VERSION >= 13020
+#include "xla/stream_executor/cuda/cuda_command_buffer_telemetry.h"
+#endif
 
 namespace stream_executor::gpu {
 
@@ -55,23 +60,21 @@ class CudaCommandBuffer final : public GpuCommandBuffer {
 
   std::string ToString() const override;
 
+  bool SupportsNodeAnnotations() const override {
+    return telemetry_strategy_ !=
+           CudaGraphAnnotationRegistry::TelemetryStrategy::kDisabled;
+  }
+
   bool has_node_priority() const { return has_node_priority_; }
 
   ~CudaCommandBuffer() override;
 
  private:
+  friend class CudaCommandBufferTestPeer;
+
   CudaCommandBuffer(Mode mode, StreamExecutor* executor,
                     CudaContext* cuda_context, CUgraph graph,
-                    bool is_owned_graph)
-      : GpuCommandBuffer(mode, executor),
-        stream_exec_(executor),
-        cuda_context_(cuda_context),
-        graph_(graph),
-        is_owned_graph_(is_owned_graph) {
-    VLOG(5) << "Created command buffer for graph " << graph_
-            << "; mode=" << absl::StrCat(mode)
-            << "; is_owned_graph=" << is_owned_graph_;
-  }
+                    bool is_owned_graph);
 
   //===--------------------------------------------------------------------===//
   // APIs for launching kernels to update conditional handles.
@@ -226,6 +229,35 @@ class CudaCommandBuffer final : public GpuCommandBuffer {
 
   absl::Status CheckCanBeUpdated() override;
 
+  // Command buffer telemetry; see cuda_command_buffer_telemetry.h. All of these
+  // are no-ops unless `ShouldRecordAnnotations()`.
+#if CUDA_VERSION >= 13020
+  // Whether annotation recording is on for this thread and this command buffer
+  // supports node annotations.
+  bool ShouldRecordAnnotations() const;
+  // `node` was just added to `graph_`.
+  void MaybeRegisterNodeAnnotation(CUgraphNode node);
+  // Annotates unannotated nodes of graphs built by stream capture or cuDNN.
+  void MaybeRegisterGraphAnnotations();
+  // `child_node` embeds a clone of `original`; copies its annotations.
+  void MaybeRegisterClonedChildAnnotations(CUgraphNode child_node,
+                                           CUgraph original);
+  // Must run before `cuGraphExecNodeSetParams(..., child_graph)`, so the
+  // cleanup is among the references it clones into the executable graph.
+  void MaybeRegisterUpdatedChildAnnotations(CUgraph child_graph);
+  // On CUDA 13.2-13.3, projects exec-graph keys.
+  void MaybeFinalizeGraphTelemetry();
+  // Tracks `graph_` once with `kNewGraph` and caches the result.
+  std::optional<command_buffer_telemetry::TrackedGraph>
+  TrackOwnGraphForTelemetry();
+#else
+  void MaybeRegisterNodeAnnotation(CUgraphNode) {}
+  void MaybeRegisterGraphAnnotations() {}
+  void MaybeRegisterClonedChildAnnotations(CUgraphNode, CUgraph) {}
+  void MaybeRegisterUpdatedChildAnnotations(CUgraph) {}
+  void MaybeFinalizeGraphTelemetry() {}
+#endif  // CUDA_VERSION >= 13020
+
   // Static helpers that are needed across different versions of CUDA.
   // We declare them here and define it in the base .cc file so its available
   // to all versions.
@@ -268,10 +300,17 @@ class CudaCommandBuffer final : public GpuCommandBuffer {
   static_assert(std::is_pointer_v<CUgraphExec>,
                 "CUgraphExec must be a pointer");
 
+  CudaGraphAnnotationRegistry::TelemetryStrategy telemetry_strategy_ =
+      CudaGraphAnnotationRegistry::TelemetryStrategy::kDisabled;
+
   CUgraph graph_ = nullptr;
   bool is_owned_graph_ = true;
   bool has_node_priority_ = false;
   CUgraphExec graph_exec_ = nullptr;
+
+#if CUDA_VERSION >= 13020
+  std::optional<command_buffer_telemetry::TrackedGraph> telemetry_graph_;
+#endif  // CUDA_VERSION >= 13020
 };
 
 }  // namespace stream_executor::gpu

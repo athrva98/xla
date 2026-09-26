@@ -38,6 +38,7 @@ namespace stream_executor::gpu {
 namespace {
 
 using ::testing::_;
+using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::Optional;
@@ -89,6 +90,27 @@ TEST(CudaGraphAnnotationRegistryTest, GetOrCreateReturnsExistingToken) {
   EXPECT_NE(other.token, first.token);
   EXPECT_TRUE(other.newly_tracked);
   EXPECT_EQ(registry.GetStats().live_graphs, 2);
+}
+
+TEST(CudaGraphAnnotationRegistryTest, GetNodeAnnotationsForTesting) {
+  Registry registry;
+  Registry::Token token = Track(registry, kGraph);
+  ASSERT_TRUE(registry.RegisterNodeAnnotation(kGraph, token, kNode2, "b"));
+  ASSERT_TRUE(registry.RegisterNodeAnnotation(kGraph, token, kNode, "a"));
+  Registry::Token exec_token =
+      registry
+          .TrackGraph(kGraph, TrackMode::kNewGraph,
+                      Registry::KeySpace::kPre134ExecGraph)
+          .token;
+  ASSERT_TRUE(registry.RegisterNodeAnnotation(
+      kGraph, exec_token, kNode, "exec", Registry::KeySpace::kPre134ExecGraph));
+
+  EXPECT_THAT(
+      registry.GetNodeAnnotationsForTesting(Registry::KeySpace::kTemplateGraph),
+      ElementsAre("a", "b"));
+  EXPECT_THAT(registry.GetNodeAnnotationsForTesting(
+                  Registry::KeySpace::kPre134ExecGraph),
+              ElementsAre("exec"));
 }
 
 TEST(CudaGraphAnnotationRegistryTest, InsertIfAbsent) {

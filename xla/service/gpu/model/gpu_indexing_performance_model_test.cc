@@ -24,16 +24,19 @@ limitations under the License.
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/MLIRContext.h"
 #include "tsl/platform/path.h"
 #include "xla/codegen/tiling/experimental/tiled_hlo.h"
 #include "xla/codegen/tiling/experimental/tiling_space.h"
-#include "xla/codegen/tiling/experimental/tiling_space_utils.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
 #include "xla/codegen/xtile/codegen/emitter_helpers.h"
 #include "xla/hlo/analysis/symbolic_expr.h"
@@ -46,6 +49,7 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/service/gpu/ir_emission_utils.h"
+#include "xla/service/gpu/mlir_context_pool.h"
 #include "xla/service/gpu/model/fusion_analysis_cache.h"
 #include "xla/service/gpu/model/gpu_dot_fusion_cost_model.h"
 #include "xla/service/gpu/model/gpu_hlo_cost_analysis.h"
@@ -1626,6 +1630,191 @@ ENTRY entry_computation {
   EXPECT_EQ(indexing_cost_model_.FlopsPerElement(instr), 0);
 }
 
+struct RegisterFitTestCase {
+  std::string name;
+  std::string hlo;
+};
+
+class RegisterFitConsistencyTest
+    : public GpuIndexingPerformanceModelTest,
+      public ::testing::WithParamInterface<RegisterFitTestCase> {};
+
+TEST_P(RegisterFitConsistencyTest, PreFilterMatchesExactFitCheck) {
+  const RegisterFitTestCase& test_case = GetParam();
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(test_case.hlo));
+  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(
+      module->entry_computation()->root_instruction());
+
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<experimental::TilingSpace> tiling_space,
+      experimental::TilingSpace::Create(*fusion_adaptor, &mlir_context_));
+
+  ASSERT_OK_AND_ASSIGN(auto tilings, tiling_space->GetValidTilings(
+                                         /*tile_reduction_dimensions=*/true));
+
+  ASSERT_OK_AND_ASSIGN(experimental::TiledHloComputation symbolic,
+                       experimental::TiledHloComputation::Tile(
+                           *fusion_adaptor, tiling_space->Clone()));
+  std::vector<const experimental::TiledHloInstruction*> tiles =
+      internal::GetRegisterResidentTiles(*fusion_adaptor, symbolic);
+
+  int64_t count_fit = 0;
+  int64_t count_not_fit = 0;
+
+  for (const llvm::SmallVector<int64_t, 4>& tiling : tilings) {
+    llvm::SmallVector<int64_t, 4> padded =
+        xla::xtile::GetPaddedTileSizes(tiling);
+    std::unique_ptr<experimental::TilingSpace> concrete_space =
+        tiling_space->Clone();
+    if (!concrete_space->AssignTileSizes(padded).ok()) {
+      continue;
+    }
+    absl::StatusOr<experimental::TiledHloComputation> concrete =
+        experimental::TiledHloComputation::Tile(*fusion_adaptor,
+                                                std::move(concrete_space));
+    if (!concrete.ok()) {
+      continue;
+    }
+
+    bool precheck_fit =
+        internal::DoesTilingFitInRegisters(tiles, padded, device_info_);
+    bool main_fit = internal::DoesComputationFitInRegisters(
+        *fusion_adaptor, *concrete, device_info_);
+
+    EXPECT_EQ(precheck_fit, main_fit) << absl::StrJoin(padded, ",");
+
+    if (main_fit) {
+      ++count_fit;
+    } else {
+      ++count_not_fit;
+    }
+  }
+
+  EXPECT_GT(count_fit, 0);
+  EXPECT_GT(count_not_fit, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    RegisterFitConsistencyTests, RegisterFitConsistencyTest,
+    ::testing::Values(RegisterFitTestCase{/*name=*/"SoftmaxLike",
+                                          /*hlo=*/R"(
+HloModule m
+add {
+  p0 = f32[] parameter(0)
+  p1 = f32[] parameter(1)
+  ROOT add = f32[] add(p0, p1)
+}
+fused {
+  p0 = f32[64,4096] parameter(0)
+  c0 = f32[] constant(0)
+  reduce = f32[64] reduce(p0, c0), dimensions={1}, to_apply=add
+  broadcast = f32[64,4096] broadcast(reduce), dimensions={0}
+  ROOT sub = f32[64,4096] subtract(p0, broadcast)
+}
+ENTRY entry {
+  p0 = f32[64,4096] parameter(0)
+  ROOT fusion = f32[64,4096] fusion(p0), kind=kCustom, calls=fused,
+    backend_config={"fusion_backend_config": {"kind":"__triton"}}
+}
+)"},
+                      RegisterFitTestCase{/*name=*/"Dot",
+                                          /*hlo=*/R"(
+HloModule m
+triton_dot {
+  p0 = bf16[1024,1024] parameter(0)
+  p1 = bf16[1024,1024] parameter(1)
+  ROOT dot = bf16[1024,1024] dot(p0, p1),
+    lhs_contracting_dims={1}, rhs_contracting_dims={0},
+    backend_config={"sizes":["32"]}
+}
+ENTRY e {
+  p0 = bf16[1024,1024] parameter(0)
+  p1 = bf16[1024,1024] parameter(1)
+  ROOT fusion = bf16[1024,1024] fusion(p0, p1),
+    kind=kCustom, calls=triton_dot,
+    backend_config={"fusion_backend_config": {"kind": "__triton_nested_gemm_fusion"}}
+}
+)"},
+                      RegisterFitTestCase{/*name=*/"Concatenate",
+                                          /*hlo=*/R"(
+HloModule m
+fused {
+  p0 = f32[64,2048] parameter(0)
+  p1 = f32[64,2048] parameter(1)
+  c0 = f32[64,4096] concatenate(p0, p1), dimensions={1}
+  ROOT neg = f32[64,4096] negate(c0)
+}
+ENTRY entry {
+  p0 = f32[64,2048] parameter(0)
+  p1 = f32[64,2048] parameter(1)
+  ROOT fusion = f32[64,4096] fusion(p0, p1), kind=kCustom, calls=fused,
+    backend_config={"fusion_backend_config": {"kind":"__triton"}}
+}
+)"},
+                      RegisterFitTestCase{/*name=*/"Iota",
+                                          /*hlo=*/R"(
+HloModule m
+fused {
+  p0 = s32[64,4096] parameter(0)
+  iota = s32[64] iota(), iota_dimension=0
+  broadcast = s32[64,4096] broadcast(iota), dimensions={0}
+  ROOT add = s32[64,4096] add(p0, broadcast)
+}
+ENTRY entry {
+  p0 = s32[64,4096] parameter(0)
+  ROOT fusion = s32[64,4096] fusion(p0), kind=kCustom, calls=fused,
+    backend_config={"fusion_backend_config": {"kind":"__triton"}}
+}
+)"},
+                      RegisterFitTestCase{/*name=*/"Transpose",
+                                          /*hlo=*/R"(
+HloModule m
+fused {
+  p0 = f32[4096,64] parameter(0)
+  transpose = f32[64,4096] transpose(p0), dimensions={1,0}
+  ROOT neg = f32[64,4096] negate(transpose)
+}
+ENTRY entry {
+  p0 = f32[4096,64] parameter(0)
+  ROOT fusion = f32[64,4096] fusion(p0), kind=kCustom, calls=fused,
+    backend_config={"fusion_backend_config": {"kind":"__triton"}}
+}
+)"},
+                      RegisterFitTestCase{/*name=*/"Reshape",
+                                          /*hlo=*/R"(
+HloModule m
+fused {
+  p0 = f32[64,64,64] parameter(0)
+  reshape = f32[4096,64] reshape(p0)
+  ROOT neg = f32[4096,64] negate(reshape)
+}
+ENTRY entry {
+  p0 = f32[64,64,64] parameter(0)
+  ROOT fusion = f32[4096,64] fusion(p0), kind=kCustom, calls=fused,
+    backend_config={"fusion_backend_config": {"kind":"__triton"}}
+}
+)"},
+                      RegisterFitTestCase{/*name=*/"DynamicSlice",
+                                          /*hlo=*/R"(
+HloModule m
+fused {
+  p0 = f32[64,4096] parameter(0)
+  offset0 = s32[] parameter(1)
+  offset1 = s32[] parameter(2)
+  ROOT ds = f32[32,2048] dynamic-slice(p0, offset0, offset1), dynamic_slice_sizes={32,2048}
+}
+ENTRY entry {
+  p0 = f32[64,4096] parameter(0)
+  offset0 = s32[] parameter(1)
+  offset1 = s32[] parameter(2)
+  ROOT fusion = f32[32,2048] fusion(p0, offset0, offset1), kind=kCustom, calls=fused,
+    backend_config={"fusion_backend_config": {"kind":"__triton"}}
+}
+)"}),
+    [](const ::testing::TestParamInfo<RegisterFitTestCase>& info) {
+      return info.param.name;
+    });
 }  // namespace
 }  // namespace gpu
 }  // namespace xla

@@ -21,12 +21,14 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/functional/function_ref.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/codegen/tiling/experimental/tiled_hlo.h"
 #include "xla/codegen/xtile/block_level_parameters.h"
@@ -163,6 +165,32 @@ class GpuPerformanceModelWithIndexingAnalysis : public GpuPerformanceModelBase {
 };
 
 namespace internal {
+
+// Returns the tiled HLOs whose tiles will likely be materialized fully in
+// registers and can not be reordered with other tiles: roots, fusion operands
+// and iotas.
+std::vector<const experimental::TiledHloInstruction*> GetRegisterResidentTiles(
+    const HloFusionAdaptor& fusion_adaptor,
+    const experimental::TiledHloComputation& tiled_hlo_computation);
+
+// Checks if all tiles in the computation fit in registers.
+//
+// There is no way to know for sure if emitted computation will not spill
+// registers, so we use a heuristic based on the sizes of register-resident
+// tiles.
+bool DoesComputationFitInRegisters(
+    const HloFusionAdaptor& fusion_adaptor,
+    const experimental::TiledHloComputation& tiled_hlo_computation,
+    const se::DeviceDescription& device_info);
+
+// Checks if the register-resident tiles of a symbolic tiled computation fit in
+// registers for the given tiling space `tile_sizes`. Allows rejecting tilings
+// before constructing the tiled computation for them.
+bool DoesTilingFitInRegisters(
+    absl::Span<const experimental::TiledHloInstruction* const>
+        symbolic_register_resident_tiles,
+    absl::Span<const int64_t> tile_sizes,
+    const se::DeviceDescription& device_info);
 
 // Precomputes FLOPs per element for all instructions in the fusion adaptor.
 absl::flat_hash_map<const HloInstruction*, int64_t> PrecomputeFlopsMap(

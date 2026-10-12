@@ -579,5 +579,40 @@ TEST_F(AsyncCollectiveCreatorTest, SplitsMultiOperandAllGather) {
   EXPECT_EQ(start->operand_count(), 2);
 }
 
+TEST_F(AsyncCollectiveCreatorTest,
+       SkipsCollectiveInComputationCalledByAsyncWrappedCall) {
+  constexpr absl::string_view hlo_string = R"(
+  HloModule test
+
+  called_computation {
+    p0 = f32[1] parameter(0)
+    ROOT ag = f32[8] all-gather(p0), dimensions={0}, replica_groups={{0,1,2,3,4,5,6,7}}
+  }
+
+  async_computation {
+    p0 = f32[1] parameter(0)
+    ROOT call = f32[8] call(p0), to_apply=called_computation
+  }
+
+  ENTRY entry {
+    p0 = f32[1] parameter(0)
+    start = ((f32[1]), f32[8], s32[]) async-start(p0), calls=async_computation
+    ROOT done = f32[8] async-done(start)
+  }
+  )";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                       ParseAndReturnVerifiedModule(hlo_string));
+  AsyncCollectiveCreator::CollectiveCreatorConfig config;
+  config.convert_all_gather = HloPredicateTrue;
+  ASSERT_THAT(AsyncCollectiveCreator(config).Run(hlo_module.get()),
+              absl_testing::IsOkAndHolds(false));
+
+  HloComputation* called_comp =
+      hlo_module->GetComputationWithName("called_computation");
+  ASSERT_THAT(called_comp, NotNull());
+  EXPECT_EQ(called_comp->root_instruction()->opcode(), HloOpcode::kAllGather);
+}
+
 }  // namespace
 }  // namespace xla

@@ -1014,6 +1014,70 @@ TEST_F(BufferAssignmentTest, OOMFallbackStrategySelection) {
   EXPECT_EQ(none_fits->GetStats().total_allocation_bytes, 288);
 }
 
+// With the fallback, FAST_MERGE first falls back to FAST_SPLIT, and the last
+// strategy replaces the algorithms that may use more memory than DEFAULT. So
+// only DEFAULT for the computations without a sequential ordering, with
+// SPATIAL, DEFAULT or BEST_OF_SPATIAL_TEMPORAL for the others, has no fallback.
+TEST_F(BufferAssignmentTest, OOMFallbackStrategiesDependOnAlgorithms) {
+  auto builder = HloComputation::Builder(TestName());
+  auto param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, f32vec4_, "param"));
+  builder.AddInstruction(
+      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kAdd, param, param));
+  auto module = CreateNewVerifiedModule();
+  module->AddEntryComputation(builder.Build());
+
+  using NonSequentialAlgorithm =
+      buffer_assignment::AssignmentAlgorithmForComputationsWithoutOrderingProto;
+  using SequentialAlgorithm = buffer_assignment::BufferAssignmentAlgorithmProto;
+  // Returns the number of evaluated strategies. The limit is below the safety
+  // margin, so no strategy fits, and the module has a single color, so the
+  // limit is queried once per evaluated strategy.
+  auto count_strategies = [&](NonSequentialAlgorithm::Value non_sequential,
+                              SequentialAlgorithm::Value sequential) {
+    BufferAssigner::Options opts;
+    opts.enable_fallback = true;
+    opts.assignment_algorithm_for_computations_without_ordering =
+        non_sequential;
+    opts.buffer_assignment_algorithm = sequential;
+    int num_strategies = 0;
+    opts.color_memory_limit = [&](LogicalBuffer::Color) -> int64_t {
+      ++num_strategies;
+      return 1;
+    };
+    EXPECT_THAT(
+        BufferAssigner::Run(
+            module.get(), std::make_unique<DependencyHloOrdering>(module.get()),
+            &BufferSizeBytes, &alias_info_,
+            [](LogicalBuffer::Color) { return 1; }, std::move(opts)),
+        ::absl_testing::IsOk());
+    return num_strategies;
+  };
+
+  struct TestCase {
+    SequentialAlgorithm::Value sequential;
+    // With DEFAULT and FAST_MERGE for the computations without a sequential
+    // ordering.
+    int num_strategies_with_default;
+    int num_strategies_with_fast_merge;
+  };
+  for (const TestCase& test_case : std::vector<TestCase>{
+           {SequentialAlgorithm::FAST_MERGE, 3, 3},
+           {SequentialAlgorithm::FAST_SPLIT, 2, 2},
+           {SequentialAlgorithm::TEMPORAL, 2, 2},
+           {SequentialAlgorithm::SPATIAL, 1, 2},
+           {SequentialAlgorithm::DEFAULT, 1, 2},
+           {SequentialAlgorithm::BEST_OF_SPATIAL_TEMPORAL, 1, 2}}) {
+    SCOPED_TRACE(SequentialAlgorithm::Value_Name(test_case.sequential));
+    EXPECT_EQ(
+        count_strategies(NonSequentialAlgorithm::DEFAULT, test_case.sequential),
+        test_case.num_strategies_with_default);
+    EXPECT_EQ(count_strategies(NonSequentialAlgorithm::FAST_MERGE,
+                               test_case.sequential),
+              test_case.num_strategies_with_fast_merge);
+  }
+}
+
 // Verifies that clearing and restoring the allocations of one color from a
 // snapshot leaves the other colors untouched and keeps the indices consistent.
 TEST_F(BufferAssignmentTest, RestoreStateForColorsOnlyReplacesGivenColors) {

@@ -3712,16 +3712,44 @@ absl::Status BufferAssigner::RunAssignBuffersWithFallback(
     backup_presets = opts_.preset_assignments->ClonePresetAssignments();
   }
 
-  // 2. Define the assignment strategies to try.
-  const std::vector<BufferAssigner::AssignmentStrategy> assignment_strategies =
-      {
-          {opts_.assignment_algorithm_for_computations_without_ordering,
-           opts_.buffer_assignment_algorithm},
-          {opts_.assignment_algorithm_for_computations_without_ordering,
-           buffer_assignment::BufferAssignmentAlgorithmProto::FAST_SPLIT},
-          {opts_.fallback_algorithm_for_computations_without_ordering,
-           opts_.fallback_algorithm},
-      };
+  // 2. Define the assignment strategies to try. FAST_MERGE first falls back to
+  // FAST_SPLIT. The last strategy replaces the algorithms that may use more
+  // memory than DEFAULT with the fallback algorithms: FAST_MERGE for the
+  // computations without a sequential ordering, and FAST_MERGE, FAST_SPLIT and
+  // TEMPORAL for the others.
+  const BufferAssigner::AssignmentStrategy primary_strategy = {
+      opts_.assignment_algorithm_for_computations_without_ordering,
+      opts_.buffer_assignment_algorithm};
+  std::vector<BufferAssigner::AssignmentStrategy> assignment_strategies = {
+      primary_strategy};
+  BufferAssigner::AssignmentStrategy fallback_strategy = primary_strategy;
+  if (primary_strategy.non_sequential_algorithm ==
+      buffer_assignment::
+          AssignmentAlgorithmForComputationsWithoutOrderingProto::FAST_MERGE) {
+    fallback_strategy.non_sequential_algorithm =
+        opts_.fallback_algorithm_for_computations_without_ordering;
+  }
+  switch (primary_strategy.sequential_algorithm) {
+    case buffer_assignment::BufferAssignmentAlgorithmProto::FAST_MERGE:
+      assignment_strategies.push_back(
+          {primary_strategy.non_sequential_algorithm,
+           buffer_assignment::BufferAssignmentAlgorithmProto::FAST_SPLIT});
+      [[fallthrough]];
+    case buffer_assignment::BufferAssignmentAlgorithmProto::FAST_SPLIT:
+    case buffer_assignment::BufferAssignmentAlgorithmProto::TEMPORAL:
+      fallback_strategy.sequential_algorithm = opts_.fallback_algorithm;
+      break;
+    default:
+      // SPATIAL, DEFAULT and BEST_OF_SPATIAL_TEMPORAL don't use more memory
+      // than DEFAULT.
+      break;
+  }
+  if (fallback_strategy.non_sequential_algorithm !=
+          primary_strategy.non_sequential_algorithm ||
+      fallback_strategy.sequential_algorithm !=
+          primary_strategy.sequential_algorithm) {
+    assignment_strategies.push_back(fallback_strategy);
+  }
 
   // The first step of RunAssignBuffers (AssignBuffersForGlobalComputations)
   // only depends on the non-sequential algorithm. Its result, i.e. the

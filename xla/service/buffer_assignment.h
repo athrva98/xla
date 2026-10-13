@@ -1155,7 +1155,15 @@ class BufferAssigner {
         fallback_algorithm =
             buffer_assignment::BufferAssignmentAlgorithmProto::DEFAULT;
 
-    // If true, evaluate memory usage and fallback to DEFAULT algorithm.
+    // If true, the memory usage of each color is checked against its limit,
+    // and the colors that exceed it are reassigned, keeping the best
+    // assignment of each color: FAST_MERGE first falls back to FAST_SPLIT, and
+    // then the algorithms that may use more memory than DEFAULT are replaced
+    // with the fallback ones. FAST_MERGE for the computations without a
+    // sequential ordering is replaced with
+    // `fallback_algorithm_for_computations_without_ordering`, and FAST_MERGE,
+    // FAST_SPLIT and TEMPORAL for the others with `fallback_algorithm`. For
+    // example, {FAST_MERGE, SPATIAL} falls back to {DEFAULT, SPATIAL}.
     bool enable_fallback = false;
 
     // Optional callback to return the memory limit for a given buffer color.

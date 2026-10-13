@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 // ==============================================================================
-// RUN: sdy_opt %s -sdy-insert-explicit-reshards='enable-full-version=true' -sdy-resolve-permutation-factors -sdy-reshard-to-collectives -sdy-convert-global-to-local -split-input-file | FileCheck %s
+// RUN: sdy_opt %s -sdy-insert-explicit-reshards='enable-full-version=true' -sdy-resolve-permutation-factors -sdy-reshard-to-collectives -sdy-pad-for-divisibility -sdy-convert-global-to-local -split-input-file | FileCheck %s
 
 sdy.mesh @mesh_xy = <["x"=2, "y"=2]>
 
@@ -514,4 +514,307 @@ func.func @scan_dim_sharded_output_not_equal_carry_fallback(
     stablehlo.return %2, %1 : tensor<8xf32>, tensor<8xf32>
   } : (tensor<12x8xf32>, tensor<8xf32>) -> (tensor<12x8xf32>, tensor<8xf32>)
   return %0#0, %0#1 : tensor<12x8xf32>, tensor<8xf32>
+}
+
+// -----
+
+sdy.mesh @mesh_x = <["x"=3]>
+
+// Pads and partitions mhlo.scan along an indivisible non-scan dimension ("x", size 10 on 3 shards).
+// Note: Declared as `private` because sdy-pad-for-divisibility rejects public
+// functions with non-divisible boundary shardings (FuncOpSignaturePattern).
+// CHECK-LABEL: func private @scan_non_scan_dim_sharded_indivisible
+// CHECK-SAME: (%arg0: tensor<16x4xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}, {"x"}]>},
+// CHECK-SAME:  %arg1: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}]>})
+// CHECK-SAME: -> (tensor<16x4xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}, {"x"}]>},
+// CHECK-SAME:     tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}]>})
+func.func private @scan_non_scan_dim_sharded_indivisible(
+    %arg0: tensor<16x10xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}, {"x"}]>},
+    %arg1: tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}]>})
+    -> (tensor<16x10xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}, {"x"}]>},
+        tensor<10xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}]>}) {
+  // CHECK-NEXT: %[[SCAN:.*]]:2 = mhlo.scan(%arg0) inits (%arg1) dimension=0
+  // CHECK-SAME:   is_associative = true
+  // CHECK-NEXT: ^bb0(%[[IN:.*]]: tensor<4xf32>, %[[CARRY:.*]]: tensor<4xf32>):
+  // CHECK-NEXT:   %[[ADD:.*]] = stablehlo.add %[[IN]], %[[CARRY]] : tensor<4xf32>
+  // CHECK-NEXT:   stablehlo.return %[[ADD]], %[[ADD]] : tensor<4xf32>, tensor<4xf32>
+  // CHECK-NEXT: } : (tensor<16x4xf32>, tensor<4xf32>) -> (tensor<16x4xf32>, tensor<4xf32>)
+  // CHECK-NEXT: return %[[SCAN]]#0, %[[SCAN]]#1 : tensor<16x4xf32>, tensor<4xf32>
+  %0:2 = mhlo.scan (%arg0) inits (%arg1) dimension=0 attributes {
+      is_associative = true,
+      sdy.sharding = #sdy.sharding_per_value<[<@mesh_x, [{}, {"x"}]>, <@mesh_x, [{"x"}]>]>
+  } {
+  ^bb0(%input0: tensor<10xf32>, %carry0: tensor<10xf32>):
+    %1 = stablehlo.add %input0, %carry0 : tensor<10xf32>
+    stablehlo.return %1, %1 : tensor<10xf32>, tensor<10xf32>
+  } : (tensor<16x10xf32>, tensor<10xf32>) -> (tensor<16x10xf32>, tensor<10xf32>)
+  return %0#0, %0#1 : tensor<16x10xf32>, tensor<10xf32>
+}
+
+// -----
+
+sdy.mesh @mesh_x = <["x"=3]>
+
+// Pads and lowers a forward scan along an indivisible scan dimension ("x", size 10 on 3 shards -> padded to 12).
+// CHECK-LABEL: func private @scan_dim_sharded_indivisible_forward
+// CHECK-SAME: (%arg0: tensor<4x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+// CHECK-SAME:  %arg1: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+// CHECK-SAME: -> (tensor<4x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+// CHECK-SAME:     tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+func.func private @scan_dim_sharded_indivisible_forward(
+    %arg0: tensor<10x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+    %arg1: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+    -> (tensor<10x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+        tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>}) {
+  // Pad input and compute global scan indices (iota + shard offset).
+  // CHECK:      stablehlo.select {{.*}}, %arg0, {{.*}} : tensor<4x8xi1>, tensor<4x8xf32>
+  // CHECK:      %[[BASE_IOTA:.*]] = stablehlo.iota dim = 0 : tensor<4x8xi32>
+  // CHECK:      %[[GLOBAL_IDX:.*]] = stablehlo.add %[[BASE_IOTA]], {{.*}} : tensor<4x8xi32>
+  //
+  // Phase 1: Local reduction of length 3 with index < 10 masking.
+  // CHECK-NEXT: %[[INIT_SLICE:.*]] = stablehlo.slice {{.*}} [0:1, 0:8] {{.*}}: (tensor<4x8xf32>) -> tensor<1x8xf32>
+  // CHECK-NEXT: %[[LOCAL_INIT:.*]] = stablehlo.reshape %[[INIT_SLICE]] {{.*}}: (tensor<1x8xf32>) -> tensor<8xf32>
+  // CHECK-NEXT: %[[REST_SLICE:.*]] = stablehlo.slice {{.*}} [1:4, 0:8] {{.*}}: (tensor<4x8xf32>) -> tensor<3x8xf32>
+  // CHECK-NEXT: %[[IDX_INIT_SLICE1:.*]] = stablehlo.slice %[[GLOBAL_IDX]] [0:1, 0:8] {{.*}}: (tensor<4x8xi32>) -> tensor<1x8xi32>
+  // CHECK-NEXT: %[[IDX_INIT1:.*]] = stablehlo.reshape %[[IDX_INIT_SLICE1]] {{.*}}: (tensor<1x8xi32>) -> tensor<8xi32>
+  // CHECK-NEXT: %[[REST_IDX:.*]] = stablehlo.slice %[[GLOBAL_IDX]] [1:4, 0:8] {{.*}}: (tensor<4x8xi32>) -> tensor<3x8xi32>
+  // CHECK-NEXT: %[[LOCAL_SCAN:.*]]:4 = mhlo.scan(%[[REST_SLICE]], %[[REST_IDX]]) inits (%[[LOCAL_INIT]], %[[IDX_INIT1]]) dimension=0
+  // CHECK-SAME:   is_associative = true
+  // CHECK-SAME:   scan_dim_size = 3 : i64
+  // CHECK-NEXT: ^bb0(%[[IN1:.*]]: tensor<8xf32>, %[[IDX1:.*]]: tensor<8xi32>, %[[CARRY1:.*]]: tensor<8xf32>, %[[IDX_CARRY1:.*]]: tensor<8xi32>):
+  // CHECK-NEXT:   %[[MUL1:.*]] = stablehlo.multiply %[[IN1]], %[[CARRY1]] : tensor<8xf32>
+  // CHECK-NEXT:   %[[LIMIT1:.*]] = stablehlo.constant dense<10> : tensor<i32>
+  // CHECK-NEXT:   %[[BCAST_LIMIT1:.*]] = stablehlo.broadcast_in_dim %[[LIMIT1]], dims = [] : (tensor<i32>) -> tensor<8xi32>
+  // CHECK-NEXT:   %[[VALID1:.*]] = stablehlo.compare LT, %[[IDX1]], %[[BCAST_LIMIT1]] : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi1>
+  // CHECK-NEXT:   %[[SEL1:.*]] = stablehlo.select %[[VALID1]], %[[MUL1]], %[[CARRY1]] : tensor<8xi1>, tensor<8xf32>
+  // CHECK-NEXT:   %[[SEL_IDX1:.*]] = stablehlo.select %[[VALID1]], %[[IDX1]], %[[IDX_CARRY1]] : tensor<8xi1>, tensor<8xi32>
+  // CHECK-NEXT:   stablehlo.return %[[SEL1]], %[[SEL_IDX1]], %[[SEL1]], %[[SEL_IDX1]] : tensor<8xf32>, tensor<8xi32>, tensor<8xf32>, tensor<8xi32>
+  // CHECK-NEXT: } : (tensor<3x8xf32>, tensor<3x8xi32>, tensor<8xf32>, tensor<8xi32>) -> (tensor<3x8xf32>, tensor<3x8xi32>, tensor<8xf32>, tensor<8xi32>)
+  // CHECK-NEXT: %[[LOCAL_TOTAL:.*]] = stablehlo.reshape %[[LOCAL_SCAN]]#2 {{.*}}: (tensor<8xf32>) -> tensor<1x8xf32>
+  //
+  // Phase 2: Cross-shard prefix scan on 3 shard totals.
+  // CHECK-NEXT: %[[GATHERED:.*]] = "stablehlo.all_gather"(%[[LOCAL_TOTAL]]) <{all_gather_dim = 0 : i64, {{.*}}}> : (tensor<1x8xf32>) -> tensor<3x8xf32>
+  // CHECK-NEXT: %[[PREFIX_SCAN:.*]]:2 = mhlo.scan(%[[GATHERED]]) inits (%arg1) dimension=0
+  // CHECK-SAME:   is_associative = true
+  // CHECK-SAME:   scan_dim_size = 3 : i64
+  // CHECK:      } : (tensor<3x8xf32>, tensor<8xf32>) -> (tensor<3x8xf32>, tensor<8xf32>)
+  //
+  // Phase 3: Final per-shard scan of length 4 with index < 10 masking.
+  // CHECK:      %[[ZERO_IDX_INIT3:.*]] = stablehlo.broadcast_in_dim {{.*}}, dims = [] {{.*}}: (tensor<i32>) -> tensor<8xi32>
+  // CHECK-NEXT: %[[FINAL_SCAN:.*]]:4 = mhlo.scan({{.*}}, %[[GLOBAL_IDX]]) inits ({{.*}}, %[[ZERO_IDX_INIT3]]) dimension=0
+  // CHECK-SAME:   is_associative = true
+  // CHECK-SAME:   scan_dim_size = 4 : i64
+  // CHECK-NEXT: ^bb0(%[[IN3:.*]]: tensor<8xf32>, %[[IDX3:.*]]: tensor<8xi32>, %[[CARRY3:.*]]: tensor<8xf32>, %[[IDX_CARRY3:.*]]: tensor<8xi32>):
+  // CHECK-NEXT:   %[[MUL3:.*]] = stablehlo.multiply %[[IN3]], %[[CARRY3]] : tensor<8xf32>
+  // CHECK-NEXT:   %[[LIMIT3:.*]] = stablehlo.constant dense<10> : tensor<i32>
+  // CHECK-NEXT:   %[[BCAST_LIMIT3:.*]] = stablehlo.broadcast_in_dim %[[LIMIT3]], dims = [] : (tensor<i32>) -> tensor<8xi32>
+  // CHECK-NEXT:   %[[VALID3:.*]] = stablehlo.compare LT, %[[IDX3]], %[[BCAST_LIMIT3]] : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi1>
+  // CHECK-NEXT:   %[[SEL3:.*]] = stablehlo.select %[[VALID3]], %[[MUL3]], %[[CARRY3]] : tensor<8xi1>, tensor<8xf32>
+  // CHECK-NEXT:   %[[SEL_IDX3:.*]] = stablehlo.select %[[VALID3]], %[[IDX3]], %[[IDX_CARRY3]] : tensor<8xi1>, tensor<8xi32>
+  // CHECK-NEXT:   stablehlo.return %[[SEL3]], %[[SEL_IDX3]], %[[SEL3]], %[[SEL_IDX3]] : tensor<8xf32>, tensor<8xi32>, tensor<8xf32>, tensor<8xi32>
+  // CHECK-NEXT: } : (tensor<4x8xf32>, tensor<4x8xi32>, tensor<8xf32>, tensor<8xi32>) -> (tensor<4x8xf32>, tensor<4x8xi32>, tensor<8xf32>, tensor<8xi32>)
+  // CHECK-NEXT: %[[OUT_SLICE:.*]] = stablehlo.slice %[[FINAL_SCAN]]#0 [0:4, 0:8] : (tensor<4x8xf32>) -> tensor<4x8xf32>
+  // CHECK-NEXT: return %[[OUT_SLICE]], %[[PREFIX_SCAN]]#1 : tensor<4x8xf32>, tensor<8xf32>
+  %0:2 = mhlo.scan (%arg0) inits (%arg1) dimension=0 attributes {
+      is_associative = true,
+      scan_dim_size = 10 : i64,
+      sdy.sharding = #sdy.sharding_per_value<[<@mesh_x, [{"x"}, {}]>, <@mesh_x, [{}]>]>
+  } {
+  ^bb0(%input0: tensor<8xf32>, %carry0: tensor<8xf32>):
+    %1 = stablehlo.multiply %input0, %carry0 : tensor<8xf32>
+    stablehlo.return %1, %1 : tensor<8xf32>, tensor<8xf32>
+  } : (tensor<10x8xf32>, tensor<8xf32>) -> (tensor<10x8xf32>, tensor<8xf32>)
+  return %0#0, %0#1 : tensor<10x8xf32>, tensor<8xf32>
+}
+
+// -----
+
+sdy.mesh @mesh_x = <["x"=3]>
+
+// Pads and lowers a reverse scan along an indivisible scan dimension ("x", size 10 on 3 shards -> padded to 12).
+// CHECK-LABEL: func private @scan_dim_sharded_indivisible_reverse
+// CHECK-SAME: (%arg0: tensor<4x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+// CHECK-SAME:  %arg1: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+// CHECK-SAME: -> (tensor<4x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+// CHECK-SAME:     tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+func.func private @scan_dim_sharded_indivisible_reverse(
+    %arg0: tensor<10x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+    %arg1: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+    -> (tensor<10x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+        tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>}) {
+  // Phase 1: Reverse local reduction masking both input and carry indices with index < 10.
+  // CHECK:      %[[REST_SLICE:.*]] = stablehlo.slice {{.*}} [0:3, 0:8] {{.*}}: (tensor<4x8xf32>) -> tensor<3x8xf32>
+  // CHECK-NEXT: %[[IDX_INIT_SLICE:.*]] = stablehlo.slice {{.*}} [3:4, 0:8] {{.*}}: (tensor<4x8xi32>) -> tensor<1x8xi32>
+  // CHECK-NEXT: %[[IDX_INIT1:.*]] = stablehlo.reshape %[[IDX_INIT_SLICE]] {{.*}}: (tensor<1x8xi32>) -> tensor<8xi32>
+  // CHECK-NEXT: %[[REST_IDX:.*]] = stablehlo.slice {{.*}} [0:3, 0:8] {{.*}}: (tensor<4x8xi32>) -> tensor<3x8xi32>
+  // CHECK-NEXT: %[[LOCAL_SCAN:.*]]:4 = mhlo.scan(%[[REST_SLICE]], %[[REST_IDX]]) inits ({{.*}}, %[[IDX_INIT1]]) dimension=0
+  // CHECK-SAME:   is_associative = true
+  // CHECK-SAME:   is_reverse = true
+  // CHECK-NEXT: ^bb0(%[[IN1:.*]]: tensor<8xf32>, %[[IDX1:.*]]: tensor<8xi32>, %[[CARRY1:.*]]: tensor<8xf32>, %[[IDX_CARRY1:.*]]: tensor<8xi32>):
+  // CHECK-NEXT:   %[[MUL1:.*]] = stablehlo.multiply %[[IN1]], %[[CARRY1]] : tensor<8xf32>
+  // CHECK-NEXT:   %[[LIMIT1:.*]] = stablehlo.constant dense<10> : tensor<i32>
+  // CHECK-NEXT:   %[[BCAST_LIMIT1:.*]] = stablehlo.broadcast_in_dim %[[LIMIT1]], dims = [] : (tensor<i32>) -> tensor<8xi32>
+  // CHECK-NEXT:   %[[VALID1:.*]] = stablehlo.compare LT, %[[IDX1]], %[[BCAST_LIMIT1]] : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi1>
+  // CHECK-NEXT:   %[[CARRY_VALID1:.*]] = stablehlo.compare LT, %[[IDX_CARRY1]], %[[BCAST_LIMIT1]] : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi1>
+  // CHECK-NEXT:   %[[INIT_OR_MUL1:.*]] = stablehlo.select %[[CARRY_VALID1]], %[[MUL1]], %[[IN1]] : tensor<8xi1>, tensor<8xf32>
+  // CHECK-NEXT:   %[[SEL1:.*]] = stablehlo.select %[[VALID1]], %[[INIT_OR_MUL1]], %[[CARRY1]] : tensor<8xi1>, tensor<8xf32>
+  // CHECK-NEXT:   %[[SEL_IDX1:.*]] = stablehlo.select %[[VALID1]], %[[IDX1]], %[[IDX_CARRY1]] : tensor<8xi1>, tensor<8xi32>
+  // CHECK-NEXT:   stablehlo.return %[[SEL1]], %[[SEL_IDX1]], %[[SEL1]], %[[SEL_IDX1]] : tensor<8xf32>, tensor<8xi32>, tensor<8xf32>, tensor<8xi32>
+  // CHECK-NEXT: } : (tensor<3x8xf32>, tensor<3x8xi32>, tensor<8xf32>, tensor<8xi32>) -> (tensor<3x8xf32>, tensor<3x8xi32>, tensor<8xf32>, tensor<8xi32>)
+  //
+  // Phase 3: Final reverse per-shard scan masking both input and carry indices with index < 10.
+  // CHECK:      %[[ZERO_IDX_INIT3:.*]] = stablehlo.broadcast_in_dim {{.*}}, dims = [] {{.*}}: (tensor<i32>) -> tensor<8xi32>
+  // CHECK-NEXT: %[[FINAL_SCAN:.*]]:4 = mhlo.scan({{.*}}, {{.*}}) inits ({{.*}}, %[[ZERO_IDX_INIT3]]) dimension=0
+  // CHECK-SAME:   is_associative = true
+  // CHECK-SAME:   is_reverse = true
+  // CHECK-NEXT: ^bb0(%[[IN3:.*]]: tensor<8xf32>, %[[IDX3:.*]]: tensor<8xi32>, %[[CARRY3:.*]]: tensor<8xf32>, %[[IDX_CARRY3:.*]]: tensor<8xi32>):
+  // CHECK-NEXT:   %[[MUL3:.*]] = stablehlo.multiply %[[IN3]], %[[CARRY3]] : tensor<8xf32>
+  // CHECK-NEXT:   %[[LIMIT3:.*]] = stablehlo.constant dense<10> : tensor<i32>
+  // CHECK-NEXT:   %[[BCAST_LIMIT3:.*]] = stablehlo.broadcast_in_dim %[[LIMIT3]], dims = [] : (tensor<i32>) -> tensor<8xi32>
+  // CHECK-NEXT:   %[[VALID3:.*]] = stablehlo.compare LT, %[[IDX3]], %[[BCAST_LIMIT3]] : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi1>
+  // CHECK-NEXT:   %[[CARRY_VALID3:.*]] = stablehlo.compare LT, %[[IDX_CARRY3]], %[[BCAST_LIMIT3]] : (tensor<8xi32>, tensor<8xi32>) -> tensor<8xi1>
+  // CHECK-NEXT:   %[[INIT_OR_MUL3:.*]] = stablehlo.select %[[CARRY_VALID3]], %[[MUL3]], %[[IN3]] : tensor<8xi1>, tensor<8xf32>
+  // CHECK-NEXT:   %[[SEL3:.*]] = stablehlo.select %[[VALID3]], %[[INIT_OR_MUL3]], %[[CARRY3]] : tensor<8xi1>, tensor<8xf32>
+  // CHECK-NEXT:   %[[SEL_IDX3:.*]] = stablehlo.select %[[VALID3]], %[[IDX3]], %[[IDX_CARRY3]] : tensor<8xi1>, tensor<8xi32>
+  // CHECK-NEXT:   stablehlo.return %[[SEL3]], %[[SEL_IDX3]], %[[SEL3]], %[[SEL_IDX3]] : tensor<8xf32>, tensor<8xi32>, tensor<8xf32>, tensor<8xi32>
+  // CHECK-NEXT: } : (tensor<4x8xf32>, tensor<4x8xi32>, tensor<8xf32>, tensor<8xi32>) -> (tensor<4x8xf32>, tensor<4x8xi32>, tensor<8xf32>, tensor<8xi32>)
+  // CHECK-NEXT: %[[OUT_SLICE:.*]] = stablehlo.slice %[[FINAL_SCAN]]#0 [0:4, 0:8] : (tensor<4x8xf32>) -> tensor<4x8xf32>
+  // CHECK-NEXT: return %[[OUT_SLICE]], {{.*}} : tensor<4x8xf32>, tensor<8xf32>
+  %0:2 = mhlo.scan (%arg0) inits (%arg1) dimension=0 attributes {
+      is_associative = true,
+      is_reverse = true,
+      sdy.sharding = #sdy.sharding_per_value<[<@mesh_x, [{"x"}, {}]>, <@mesh_x, [{}]>]>
+  } {
+  ^bb0(%input0: tensor<8xf32>, %carry0: tensor<8xf32>):
+    %1 = stablehlo.multiply %input0, %carry0 : tensor<8xf32>
+    stablehlo.return %1, %1 : tensor<8xf32>, tensor<8xf32>
+  } : (tensor<10x8xf32>, tensor<8xf32>) -> (tensor<10x8xf32>, tensor<8xf32>)
+  return %0#0, %0#1 : tensor<10x8xf32>, tensor<8xf32>
+}
+
+// -----
+
+sdy.mesh @mesh_x = <["x"=4]>
+
+// Falls back to replicating the scan dimension ("x") when a trailing shard has 0 valid elements (size 5 on 4 shards).
+// CHECK-LABEL: func private @scan_dim_sharded_indivisible_empty_shard_fallback
+// CHECK-SAME: (%arg0: tensor<2x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+// CHECK-SAME:  %arg1: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+// CHECK-SAME: -> (tensor<2x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+// CHECK-SAME:     tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+func.func private @scan_dim_sharded_indivisible_empty_shard_fallback(
+    %arg0: tensor<5x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+    %arg1: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>})
+    -> (tensor<5x8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{"x"}, {}]>},
+        tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_x, [{}]>}) {
+  // CHECK-NEXT: %[[GATHERED:.*]] = "stablehlo.all_gather"(%arg0) <{all_gather_dim = 0 : i64, {{.*}}}> : (tensor<2x8xf32>) -> tensor<8x8xf32>
+  // CHECK-NEXT: %[[SLICED_IN:.*]] = stablehlo.slice %[[GATHERED]] [0:5, 0:8] {{.*}}: (tensor<8x8xf32>) -> tensor<5x8xf32>
+  // CHECK-NEXT: %[[SCAN:.*]]:2 = mhlo.scan(%[[SLICED_IN]]) inits (%arg1) dimension=0
+  // CHECK:      } : (tensor<5x8xf32>, tensor<8xf32>) -> (tensor<5x8xf32>, tensor<8xf32>)
+  // CHECK:      %[[SLICED_OUT:.*]] = stablehlo.dynamic_slice {{.*}}, sizes = [2, 8] : (tensor<8x8xf32>, tensor<i32>, tensor<i32>) -> tensor<2x8xf32>
+  // CHECK-NEXT: return %[[SLICED_OUT]], %[[SCAN]]#1 : tensor<2x8xf32>, tensor<8xf32>
+  %0:2 = mhlo.scan (%arg0) inits (%arg1) dimension=0 attributes {
+      is_associative = true,
+      sdy.sharding = #sdy.sharding_per_value<[<@mesh_x, [{"x"}, {}]>, <@mesh_x, [{}]>]>
+  } {
+  ^bb0(%input0: tensor<8xf32>, %carry0: tensor<8xf32>):
+    %1 = stablehlo.add %input0, %carry0 : tensor<8xf32>
+    stablehlo.return %1, %1 : tensor<8xf32>, tensor<8xf32>
+  } : (tensor<5x8xf32>, tensor<8xf32>) -> (tensor<5x8xf32>, tensor<8xf32>)
+  return %0#0, %0#1 : tensor<5x8xf32>, tensor<8xf32>
+}
+
+// -----
+
+sdy.mesh @mesh_xy = <["x"=3, "y"=2]>
+
+// Pads and lowers a 2D variadic scan along an indivisible scan dimension (dimension=1, size 10 on 3 shards -> padded to 12).
+// CHECK-LABEL: func private @scan_dim_sharded_indivisible_variadic_2d
+// CHECK-SAME: (%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+// CHECK-SAME:  %arg1: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+// CHECK-SAME:  %arg2: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>},
+// CHECK-SAME:  %arg3: tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>})
+// CHECK-SAME: -> (tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+// CHECK-SAME:     tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+// CHECK-SAME:     tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>},
+// CHECK-SAME:     tensor<4xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>})
+func.func private @scan_dim_sharded_indivisible_variadic_2d(
+    %arg0: tensor<8x10xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+    %arg1: tensor<8x10xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+    %arg2: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>},
+    %arg3: tensor<8xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>})
+    -> (tensor<8x10xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+        tensor<8x10xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}, {"x"}]>},
+        tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>},
+        tensor<8xi32> {sdy.sharding = #sdy.sharding<@mesh_xy, [{"y"}]>}) {
+  // Pad both inputs and compute global scan indices along dimension=1.
+  // CHECK:      stablehlo.select {{.*}}, %arg0, {{.*}} : tensor<4x4xi1>, tensor<4x4xf32>
+  // CHECK:      stablehlo.select {{.*}}, %arg1, {{.*}} : tensor<4x4xi1>, tensor<4x4xi32>
+  // CHECK:      %[[BASE_IOTA:.*]] = stablehlo.iota dim = 1 : tensor<4x4xi32>
+  // CHECK:      %[[GLOBAL_IDX:.*]] = stablehlo.add %[[BASE_IOTA]], {{.*}} : tensor<4x4xi32>
+  //
+  // Phase 1: Variadic local reduction of length 3 along dimension=1 with index < 10 masking.
+  // CHECK-NEXT: %[[INIT_SLICE0:.*]] = stablehlo.slice {{.*}} [0:4, 0:1] {{.*}}: (tensor<4x4xf32>) -> tensor<4x1xf32>
+  // CHECK-NEXT: %[[LOCAL_INIT0:.*]] = stablehlo.reshape %[[INIT_SLICE0]] {{.*}}: (tensor<4x1xf32>) -> tensor<4xf32>
+  // CHECK-NEXT: %[[REST_SLICE0:.*]] = stablehlo.slice {{.*}} [0:4, 1:4] {{.*}}: (tensor<4x4xf32>) -> tensor<4x3xf32>
+  // CHECK-NEXT: %[[INIT_SLICE1:.*]] = stablehlo.slice {{.*}} [0:4, 0:1] {{.*}}: (tensor<4x4xi32>) -> tensor<4x1xi32>
+  // CHECK-NEXT: %[[LOCAL_INIT1:.*]] = stablehlo.reshape %[[INIT_SLICE1]] {{.*}}: (tensor<4x1xi32>) -> tensor<4xi32>
+  // CHECK-NEXT: %[[REST_SLICE1:.*]] = stablehlo.slice {{.*}} [0:4, 1:4] {{.*}}: (tensor<4x4xi32>) -> tensor<4x3xi32>
+  // CHECK-NEXT: %[[IDX_INIT_SLICE1:.*]] = stablehlo.slice %[[GLOBAL_IDX]] [0:4, 0:1] {{.*}}: (tensor<4x4xi32>) -> tensor<4x1xi32>
+  // CHECK-NEXT: %[[IDX_INIT1:.*]] = stablehlo.reshape %[[IDX_INIT_SLICE1]] {{.*}}: (tensor<4x1xi32>) -> tensor<4xi32>
+  // CHECK-NEXT: %[[REST_IDX:.*]] = stablehlo.slice %[[GLOBAL_IDX]] [0:4, 1:4] {{.*}}: (tensor<4x4xi32>) -> tensor<4x3xi32>
+  // CHECK-NEXT: %[[LOCAL_SCAN:.*]]:6 = mhlo.scan(%[[REST_SLICE0]], %[[REST_SLICE1]], %[[REST_IDX]]) inits (%[[LOCAL_INIT0]], %[[LOCAL_INIT1]], %[[IDX_INIT1]]) dimension=1
+  // CHECK-SAME:   is_associative = true
+  // CHECK-NEXT: ^bb0(%[[IN1_0:.*]]: tensor<4xf32>, %[[IN1_1:.*]]: tensor<4xi32>, %[[IDX1:.*]]: tensor<4xi32>, %[[CARRY1_0:.*]]: tensor<4xf32>, %[[CARRY1_1:.*]]: tensor<4xi32>, %[[IDX_CARRY1:.*]]: tensor<4xi32>):
+  // CHECK-NEXT:   %[[ADD1_0:.*]] = stablehlo.add %[[IN1_0]], %[[CARRY1_0]] : tensor<4xf32>
+  // CHECK-NEXT:   %[[ADD1_1:.*]] = stablehlo.add %[[IN1_1]], %[[CARRY1_1]] : tensor<4xi32>
+  // CHECK-NEXT:   %[[LIMIT1:.*]] = stablehlo.constant dense<10> : tensor<i32>
+  // CHECK-NEXT:   %[[BCAST_LIMIT1:.*]] = stablehlo.broadcast_in_dim %[[LIMIT1]], dims = [] : (tensor<i32>) -> tensor<4xi32>
+  // CHECK-NEXT:   %[[VALID1:.*]] = stablehlo.compare LT, %[[IDX1]], %[[BCAST_LIMIT1]] : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
+  // CHECK-NEXT:   %[[SEL1_0:.*]] = stablehlo.select %[[VALID1]], %[[ADD1_0]], %[[CARRY1_0]] : tensor<4xi1>, tensor<4xf32>
+  // CHECK-NEXT:   %[[SEL1_1:.*]] = stablehlo.select %[[VALID1]], %[[ADD1_1]], %[[CARRY1_1]] : tensor<4xi1>, tensor<4xi32>
+  // CHECK-NEXT:   %[[SEL_IDX1:.*]] = stablehlo.select %[[VALID1]], %[[IDX1]], %[[IDX_CARRY1]] : tensor<4xi1>, tensor<4xi32>
+  // CHECK-NEXT:   stablehlo.return %[[SEL1_0]], %[[SEL1_1]], %[[SEL_IDX1]], %[[SEL1_0]], %[[SEL1_1]], %[[SEL_IDX1]] : tensor<4xf32>, tensor<4xi32>, tensor<4xi32>, tensor<4xf32>, tensor<4xi32>, tensor<4xi32>
+  // CHECK-NEXT: } : (tensor<4x3xf32>, tensor<4x3xi32>, tensor<4x3xi32>, tensor<4xf32>, tensor<4xi32>, tensor<4xi32>) -> (tensor<4x3xf32>, tensor<4x3xi32>, tensor<4x3xi32>, tensor<4xf32>, tensor<4xi32>, tensor<4xi32>)
+  // CHECK-NEXT: %[[LOCAL_TOTAL0:.*]] = stablehlo.reshape %[[LOCAL_SCAN]]#3 {{.*}}: (tensor<4xf32>) -> tensor<4x1xf32>
+  // CHECK-NEXT: %[[LOCAL_TOTAL1:.*]] = stablehlo.reshape %[[LOCAL_SCAN]]#4 {{.*}}: (tensor<4xi32>) -> tensor<4x1xi32>
+  //
+  // Phase 2: Cross-shard prefix scan on 3 shard totals along dimension=1.
+  // CHECK-NEXT: %[[GATHERED0:.*]] = "stablehlo.all_gather"(%[[LOCAL_TOTAL0]]) <{all_gather_dim = 1 : i64, {{.*}}}> : (tensor<4x1xf32>) -> tensor<4x3xf32>
+  // CHECK-NEXT: %[[GATHERED1:.*]] = "stablehlo.all_gather"(%[[LOCAL_TOTAL1]]) <{all_gather_dim = 1 : i64, {{.*}}}> : (tensor<4x1xi32>) -> tensor<4x3xi32>
+  // CHECK-NEXT: %[[PREFIX_SCAN:.*]]:4 = mhlo.scan(%[[GATHERED0]], %[[GATHERED1]]) inits (%arg2, %arg3) dimension=1
+  // CHECK-SAME:   is_associative = true
+  // CHECK:      } : (tensor<4x3xf32>, tensor<4x3xi32>, tensor<4xf32>, tensor<4xi32>) -> (tensor<4x3xf32>, tensor<4x3xi32>, tensor<4xf32>, tensor<4xi32>)
+  //
+  // Phase 3: Final variadic per-shard scan of length 4 along dimension=1 with index < 10 masking.
+  // CHECK:      %[[ZERO_IDX_INIT3:.*]] = stablehlo.broadcast_in_dim {{.*}}, dims = [] {{.*}}: (tensor<i32>) -> tensor<4xi32>
+  // CHECK-NEXT: %[[FINAL_SCAN:.*]]:6 = mhlo.scan({{.*}}, {{.*}}, %[[GLOBAL_IDX]]) inits ({{.*}}, {{.*}}, %[[ZERO_IDX_INIT3]]) dimension=1
+  // CHECK-SAME:   is_associative = true
+  // CHECK-NEXT: ^bb0(%[[IN3_0:.*]]: tensor<4xf32>, %[[IN3_1:.*]]: tensor<4xi32>, %[[IDX3:.*]]: tensor<4xi32>, %[[CARRY3_0:.*]]: tensor<4xf32>, %[[CARRY3_1:.*]]: tensor<4xi32>, %[[IDX_CARRY3:.*]]: tensor<4xi32>):
+  // CHECK-NEXT:   %[[ADD3_0:.*]] = stablehlo.add %[[IN3_0]], %[[CARRY3_0]] : tensor<4xf32>
+  // CHECK-NEXT:   %[[ADD3_1:.*]] = stablehlo.add %[[IN3_1]], %[[CARRY3_1]] : tensor<4xi32>
+  // CHECK-NEXT:   %[[LIMIT3:.*]] = stablehlo.constant dense<10> : tensor<i32>
+  // CHECK-NEXT:   %[[BCAST_LIMIT3:.*]] = stablehlo.broadcast_in_dim %[[LIMIT3]], dims = [] : (tensor<i32>) -> tensor<4xi32>
+  // CHECK-NEXT:   %[[VALID3:.*]] = stablehlo.compare LT, %[[IDX3]], %[[BCAST_LIMIT3]] : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
+  // CHECK-NEXT:   %[[SEL3_0:.*]] = stablehlo.select %[[VALID3]], %[[ADD3_0]], %[[CARRY3_0]] : tensor<4xi1>, tensor<4xf32>
+  // CHECK-NEXT:   %[[SEL3_1:.*]] = stablehlo.select %[[VALID3]], %[[ADD3_1]], %[[CARRY3_1]] : tensor<4xi1>, tensor<4xi32>
+  // CHECK-NEXT:   %[[SEL_IDX3:.*]] = stablehlo.select %[[VALID3]], %[[IDX3]], %[[IDX_CARRY3]] : tensor<4xi1>, tensor<4xi32>
+  // CHECK-NEXT:   stablehlo.return %[[SEL3_0]], %[[SEL3_1]], %[[SEL_IDX3]], %[[SEL3_0]], %[[SEL3_1]], %[[SEL_IDX3]] : tensor<4xf32>, tensor<4xi32>, tensor<4xi32>, tensor<4xf32>, tensor<4xi32>, tensor<4xi32>
+  // CHECK-NEXT: } : (tensor<4x4xf32>, tensor<4x4xi32>, tensor<4x4xi32>, tensor<4xf32>, tensor<4xi32>, tensor<4xi32>) -> (tensor<4x4xf32>, tensor<4x4xi32>, tensor<4x4xi32>, tensor<4xf32>, tensor<4xi32>, tensor<4xi32>)
+  // CHECK-NEXT: %[[OUT_SLICE0:.*]] = stablehlo.slice %[[FINAL_SCAN]]#0 [0:4, 0:4] : (tensor<4x4xf32>) -> tensor<4x4xf32>
+  // CHECK-NEXT: %[[OUT_SLICE1:.*]] = stablehlo.slice %[[FINAL_SCAN]]#1 [0:4, 0:4] : (tensor<4x4xi32>) -> tensor<4x4xi32>
+  // CHECK-NEXT: return %[[OUT_SLICE0]], %[[OUT_SLICE1]], %[[PREFIX_SCAN]]#2, %[[PREFIX_SCAN]]#3 : tensor<4x4xf32>, tensor<4x4xi32>, tensor<4xf32>, tensor<4xi32>
+  %0:4 = mhlo.scan (%arg0, %arg1) inits (%arg2, %arg3) dimension=1 attributes {
+      is_associative = true,
+      sdy.sharding = #sdy.sharding_per_value<[
+          <@mesh_xy, [{"y"}, {"x"}]>, <@mesh_xy, [{"y"}, {"x"}]>,
+          <@mesh_xy, [{"y"}]>, <@mesh_xy, [{"y"}]>]>
+  } {
+  ^bb0(%in0: tensor<8xf32>, %in1: tensor<8xi32>, %carry0: tensor<8xf32>, %carry1: tensor<8xi32>):
+    %add0 = stablehlo.add %in0, %carry0 : tensor<8xf32>
+    %add1 = stablehlo.add %in1, %carry1 : tensor<8xi32>
+    stablehlo.return %add0, %add1, %add0, %add1 : tensor<8xf32>, tensor<8xi32>, tensor<8xf32>, tensor<8xi32>
+  } : (tensor<8x10xf32>, tensor<8x10xi32>, tensor<8xf32>, tensor<8xi32>)
+      -> (tensor<8x10xf32>, tensor<8x10xi32>, tensor<8xf32>, tensor<8xi32>)
+  return %0#0, %0#1, %0#2, %0#3 : tensor<8x10xf32>, tensor<8x10xi32>, tensor<8xf32>, tensor<8xi32>
 }

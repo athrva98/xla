@@ -25,6 +25,7 @@ limitations under the License.
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -47,6 +48,7 @@ limitations under the License.
 #include "shardy/dialect/sdy/ir/dialect.h"
 #include "shardy/dialect/sdy/ir/enums.h"
 #include "shardy/dialect/sdy/ir/utils.h"
+#include "shardy/dialect/sdy/transforms/export/utils.h"
 #include "shardy/dialect/sdy/transforms/propagation/op_sharding_rule_builder.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "xla/mlir_hlo/mhlo/IR/hlo_ops.h"
@@ -399,18 +401,100 @@ mlir::Value collapseSingleSliceToCarry(
   return reshapeOp.getResult();
 }
 
+// Masking operands for padding an indivisible scan dimension.
+struct ScanMaskOperands {
+  mlir::Value idxInput;
+  mlir::Value idxInit;
+  int64_t globalScanSize;
+};
+
+// Inserts index slice and carry block arguments into `newScan`'s body and masks
+// terminator outputs and carries so padded steps (`>= globalScanSize`) act as a
+// two-sided identity.
+void maskClonedScanBody(mhlo::ScanOp newScan, int64_t globalScanSize,
+                        mlir::IRRewriter& rewriter) {
+  int64_t numInputs = newScan.getInputs().size() - 1;
+  auto idxSliceType =
+      llvm::cast<mlir::RankedTensorType>(newScan.getInits().back().getType());
+  mlir::Location loc = newScan.getLoc();
+  bool isReverse = newScan.getIsReverse();
+  mlir::Block& bodyBlock = newScan.getBody().front();
+  mlir::Value idxArg = bodyBlock.insertArgument(numInputs, idxSliceType, loc);
+  mlir::Value idxCarryArg = bodyBlock.addArgument(idxSliceType, loc);
+
+  mlir::Operation* returnOp = bodyBlock.getTerminator();
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(returnOp);
+
+  auto scalarI32Type = mlir::RankedTensorType::get({}, rewriter.getI32Type());
+  auto limitConst = mlir::stablehlo::ConstantOp::create(
+      rewriter, loc,
+      mlir::DenseIntElementsAttr::get(scalarI32Type,
+                                      {static_cast<int32_t>(globalScanSize)}));
+  auto bcastLimit = mlir::stablehlo::BroadcastInDimOp::create(
+      rewriter, loc, idxSliceType, limitConst,
+      rewriter.getDenseI64ArrayAttr({}));
+  auto isValid = mlir::stablehlo::CompareOp::create(
+      rewriter, loc, idxArg, bcastLimit,
+      mlir::stablehlo::ComparisonDirection::LT);
+
+  mlir::Value isCarryValid;
+  if (isReverse) {
+    isCarryValid = mlir::stablehlo::CompareOp::create(
+        rewriter, loc, idxCarryArg, bcastLimit,
+        mlir::stablehlo::ComparisonDirection::LT);
+  }
+
+  mlir::SmallVector<mlir::Value> maskedOuts(numInputs);
+  mlir::SmallVector<mlir::Value> maskedCarries(numInputs);
+  for (int64_t k = 0; k < numInputs; ++k) {
+    mlir::Value inputArg = bodyBlock.getArgument(k);
+    mlir::Value carryArg = bodyBlock.getArgument(numInputs + 1 + k);
+    mlir::Value maskedVal = returnOp->getOperand(k);
+    if (isReverse) {
+      maskedVal = mlir::stablehlo::SelectOp::create(rewriter, loc, isCarryValid,
+                                                    maskedVal, inputArg);
+    }
+    maskedOuts[k] = mlir::stablehlo::SelectOp::create(rewriter, loc, isValid,
+                                                      maskedVal, carryArg);
+    // Reuse maskedOuts[k] since createScanLoweringContext guarantees matching
+    // output and carry terminator operands.
+    maskedCarries[k] = maskedOuts[k];
+  }
+  auto maskedIdx = mlir::stablehlo::SelectOp::create(rewriter, loc, isValid,
+                                                     idxArg, idxCarryArg);
+
+  mlir::SmallVector<mlir::Value> newReturnOperands;
+  newReturnOperands.reserve(2 * (numInputs + 1));
+  newReturnOperands.append(maskedOuts.begin(), maskedOuts.end());
+  newReturnOperands.push_back(maskedIdx.getResult());
+  newReturnOperands.append(maskedCarries.begin(), maskedCarries.end());
+  newReturnOperands.push_back(maskedIdx.getResult());
+  returnOp->setOperands(newReturnOperands);
+}
+
 // Clones `scan` with updated operands and result shardings, inferring output
 // types from `inputs`, carry types from `inits`, and `scan_dim_size` from
-// `inputs[0]`.
+// `inputs[0]`. When `mask` is provided, appends the index input/init/output/
+// carry and masks padded steps in the cloned body.
 mhlo::ScanOp createScanWithClonedBody(
     mhlo::ScanOp scan, mlir::ValueRange inputs, mlir::ValueRange inits,
     ArrayRef<mlir::sdy::TensorShardingAttr> outputShardings,
     ArrayRef<mlir::sdy::TensorShardingAttr> carryShardings,
-    mlir::IRRewriter& rewriter) {
+    std::optional<ScanMaskOperands> mask, mlir::IRRewriter& rewriter) {
+  int64_t numScanInputs = inputs.size() + (mask.has_value() ? 1 : 0);
+  int64_t numScanInits = inits.size() + (mask.has_value() ? 1 : 0);
+
   mlir::SmallVector<mlir::Value> operands;
-  operands.reserve(inputs.size() + inits.size());
+  operands.reserve(numScanInputs + numScanInits);
   operands.append(inputs.begin(), inputs.end());
+  if (mask.has_value()) {
+    operands.push_back(mask->idxInput);
+  }
   operands.append(inits.begin(), inits.end());
+  if (mask.has_value()) {
+    operands.push_back(mask->idxInit);
+  }
 
   mlir::NamedAttrList discardableAttrs(scan->getDiscardableAttrDictionary());
   discardableAttrs.erase(mlir::sdy::kShardingRuleAttr);
@@ -419,6 +503,11 @@ mhlo::ScanOp createScanWithClonedBody(
   auto newScan = mhlo::ScanOp::create(
       rewriter, scan.getLoc(), mlir::ValueRange(operands).getTypes(), operands,
       scan.getProperties(), discardableAttrs.getAttrs());
+  auto segmentSizes =
+      rewriter.getDenseI32ArrayAttr({static_cast<int32_t>(numScanInputs),
+                                     static_cast<int32_t>(numScanInits)});
+  newScan->setAttr(mhlo::ScanOp::getOperandSegmentSizeAttr(), segmentSizes);
+  newScan->setAttr(mhlo::ScanOp::getResultSegmentSizeAttr(), segmentSizes);
   if (scan.getScanDimSize().has_value()) {
     auto in0Type = llvm::cast<mlir::RankedTensorType>(inputs[0].getType());
     newScan.setScanDimSize(in0Type.getDimSize(scan.getDimension()));
@@ -427,10 +516,20 @@ mhlo::ScanOp createScanWithClonedBody(
                              newScan.getBody().end());
 
   mlir::SmallVector<mlir::sdy::TensorShardingAttr> resultShardings;
-  resultShardings.reserve(outputShardings.size() + carryShardings.size());
+  resultShardings.reserve(numScanInputs + numScanInits);
   resultShardings.append(outputShardings.begin(), outputShardings.end());
+  if (mask.has_value()) {
+    resultShardings.push_back(outputShardings[0]);
+  }
   resultShardings.append(carryShardings.begin(), carryShardings.end());
+  if (mask.has_value()) {
+    resultShardings.push_back(carryShardings[0]);
+  }
   mlir::sdy::setShardings(newScan, resultShardings);
+
+  if (mask.has_value()) {
+    maskClonedScanBody(newScan, mask->globalScanSize, rewriter);
+  }
   return newScan;
 }
 
@@ -620,7 +719,7 @@ void localizeElementwiseBodyToPerStepSliceShape(
 // per-step slice shapes in its body.
 mlir::LogicalResult rebuildScanWithUpdatedOperandsAndResultTypes(
     mhlo::ScanOp scan, mlir::ValueRange operands,
-    const mlir::TypeConverter& typeConverter,
+    const mlir::TypeConverter& typeConverter, bool dropShardingRule,
     mlir::ConversionPatternRewriter& rewriter) {
   mlir::SmallVector<mlir::Type> newResultTypes;
   if (mlir::failed(
@@ -631,18 +730,21 @@ mlir::LogicalResult rebuildScanWithUpdatedOperandsAndResultTypes(
   int64_t numInputs = scan.getInputs().size();
   int64_t scanDim = scan.getDimension();
 
-  // Update scan_dim_size to the local size and drop sdy.sharding_rule.
+  // Update scan_dim_size to the converted input's scan-dim size and optionally
+  // drop sdy.sharding_rule. All scan inputs share the same scan dimension size.
   mlir::NamedAttrList discardableAttrs(scan->getDiscardableAttrDictionary());
-  discardableAttrs.erase(mlir::sdy::kShardingRuleAttr);
+  if (dropShardingRule) {
+    discardableAttrs.erase(mlir::sdy::kShardingRuleAttr);
+  }
 
   auto newScan =
       mhlo::ScanOp::create(rewriter, scan.getLoc(), newResultTypes, operands,
                            scan.getProperties(), discardableAttrs.getAttrs());
   if (scan.getScanDimSize().has_value() && numInputs > 0) {
-    auto localIn0Type =
+    auto newIn0Type =
         llvm::dyn_cast<mlir::RankedTensorType>(operands[0].getType());
-    if (localIn0Type && !localIn0Type.isDynamicDim(scanDim)) {
-      newScan.setScanDimSize(localIn0Type.getDimSize(scanDim));
+    if (newIn0Type && !newIn0Type.isDynamicDim(scanDim)) {
+      newScan.setScanDimSize(newIn0Type.getDimSize(scanDim));
     }
   }
   rewriter.cloneRegionBefore(scan.getBody(), newScan.getBody(),
@@ -689,8 +791,12 @@ struct ScanLoweringContext {
   int64_t numInputs;
   int64_t numPartitions;
   int64_t localScanSize;
-  mlir::ValueRange scanInputs;
+  int64_t globalScanSize;
+  bool needsScanPadding = false;
+  mlir::SmallVector<mlir::Value> scanInputs;
   mlir::ValueRange inits;
+  mlir::Value globalIdxTensor;
+  mlir::Type localIdxType;
   mlir::SmallVector<mlir::StringAttr> manualAxes;
   mlir::SmallVector<mlir::sdy::TensorShardingAttr> inShardings;
   mlir::SmallVector<mlir::sdy::TensorShardingAttr> outShardings;
@@ -705,6 +811,40 @@ struct CrossShardPrefixScanResult {
   mhlo::ScanOp prefixScan;
   mlir::SmallVector<mlir::Value> shardedIncs;
 };
+
+// If `ctx.needsScanPadding` is true, pads `ctx.scanInputs` along `ctx.scanDim`
+// to `paddedScanSize` and creates the global index `iota` tensor and local
+// index type used to mask out padded scan steps.
+void maybePadScanInputsAndCreateGlobalIdx(int64_t paddedScanSize,
+                                          ScanLoweringContext& ctx,
+                                          mlir::IRRewriter& rewriter) {
+  if (!ctx.needsScanPadding) {
+    return;
+  }
+  for (int64_t i = 0; i < ctx.numInputs; ++i) {
+    mlir::RankedTensorType paddedInType =
+        withDimSize(ctx.scanInputs[i].getType(), ctx.scanDim, paddedScanSize);
+    ctx.scanInputs[i] = mlir::sdy::padHighSideToType(
+        rewriter, ctx.loc, ctx.scanInputs[i], paddedInType, ctx.inShardings[i]);
+  }
+  // Reuse input 0's padded shape and sharding for the global index tensor. By
+  // the shape-preserving invariant and uniform factor mapping in the sharding
+  // rule, all inputs share the same per-step slice shape and sharding along
+  // every dimension.
+  auto paddedIn0Type =
+      llvm::cast<mlir::RankedTensorType>(ctx.scanInputs[0].getType());
+  auto globalIdxType = mlir::RankedTensorType::get(paddedIn0Type.getShape(),
+                                                   rewriter.getI32Type());
+  auto globalIdxOp =
+      mlir::stablehlo::IotaOp::create(rewriter, ctx.loc, globalIdxType,
+                                      rewriter.getI64IntegerAttr(ctx.scanDim));
+  mlir::sdy::setShardings(globalIdxOp, ctx.inShardings[0]);
+  ctx.globalIdxTensor = globalIdxOp.getResult();
+  mlir::RankedTensorType localIn0Type =
+      withDimSize(ctx.scanInputs[0].getType(), ctx.scanDim, ctx.localScanSize);
+  ctx.localIdxType = mlir::RankedTensorType::get(localIn0Type.getShape(),
+                                                 rewriter.getI32Type());
+}
 
 // Validates preconditions and populates `ScanLoweringContext` for `scan`.
 std::optional<ScanLoweringContext> createScanLoweringContext(
@@ -763,12 +903,16 @@ std::optional<ScanLoweringContext> createScanLoweringContext(
   if (numPartitions <= 1 || globalScanSize <= 0) {
     return std::nullopt;
   }
-  // TODO(b/537364058): Support indivisible scan dimension padding.
-  if (globalScanSize % numPartitions != 0) {
-    return std::nullopt;
-  }
-  int64_t localScanSize = globalScanSize / numPartitions;
-  if (localScanSize <= 1) {
+  int64_t paddedScanSize = llvm::alignTo(globalScanSize, numPartitions);
+  int64_t localScanSize = paddedScanSize / numPartitions;
+  bool needsScanPadding = paddedScanSize != globalScanSize;
+  // Require localScanSize > 1 (so Phase 1 can split each shard into 1 init
+  // slice and localScanSize - 1 rest slices) and at least one valid element per
+  // shard ((P - 1) * M < N). If a trailing shard had only padded elements,
+  // seeding its Phase 1 local carry from a padded slice without an algebraic
+  // identity element would corrupt the cross-shard prefix scan.
+  if (localScanSize <= 1 ||
+      (numPartitions - 1) * localScanSize >= globalScanSize) {
     return std::nullopt;
   }
 
@@ -780,8 +924,13 @@ std::optional<ScanLoweringContext> createScanLoweringContext(
       /*numInputs=*/numInputs,
       /*numPartitions=*/numPartitions,
       /*localScanSize=*/localScanSize,
-      /*scanInputs=*/inputs,
+      /*globalScanSize=*/globalScanSize,
+      /*needsScanPadding=*/needsScanPadding,
+      /*scanInputs=*/
+      mlir::SmallVector<mlir::Value>(inputs.begin(), inputs.end()),
       /*inits=*/inits,
+      /*globalIdxTensor=*/mlir::Value(),
+      /*localIdxType=*/mlir::Type(),
       /*manualAxes=*/std::move(manualAxes),
   };
   ctx.inShardings.reserve(numInputs);
@@ -810,7 +959,30 @@ std::optional<ScanLoweringContext> createScanLoweringContext(
     ctx.innerCarryShardings.push_back(
         mlir::sdy::eraseManualAxes(carrySharding, ctx.manualAxes));
   }
+
+  maybePadScanInputsAndCreateGlobalIdx(paddedScanSize, ctx, rewriter);
   return ctx;
+}
+
+// If `ctx.needsScanPadding` is true, slices the Phase 1 local index argument
+// into the initial index slice and remaining index slices for masking.
+std::optional<ScanMaskOperands> maybeCreatePhaseOneMask(
+    const ScanLoweringContext& ctx, mlir::Block& phaseOneBlock,
+    int64_t initStart, int64_t initLimit, int64_t restStart, int64_t restLimit,
+    mlir::IRRewriter& rewriter) {
+  if (!ctx.needsScanPadding) {
+    return std::nullopt;
+  }
+  mlir::Value localIdx = phaseOneBlock.getArgument(ctx.numInputs);
+  mlir::Value idxInitSlice =
+      createSliceAlongDim(rewriter, ctx.loc, localIdx, ctx.scanDim, initStart,
+                          initLimit, ctx.scanReplicatedInShardings[0]);
+  mlir::Value idxInit = collapseSingleSliceToCarry(
+      rewriter, ctx.loc, idxInitSlice, ctx.scanDim, ctx.innerCarryShardings[0]);
+  mlir::Value restIdx =
+      createSliceAlongDim(rewriter, ctx.loc, localIdx, ctx.scanDim, restStart,
+                          restLimit, ctx.scanReplicatedInShardings[0]);
+  return ScanMaskOperands{restIdx, idxInit, ctx.globalScanSize};
 }
 
 // Phase 1: Emits a per-shard local reduction via `sdy.manual_computation`,
@@ -825,18 +997,30 @@ mlir::sdy::ManualComputationOp buildLocalScanReduction(
                                             ctx.scanDim, ctx.numPartitions));
   }
 
-  auto phase1ManualComp = mlir::sdy::ManualComputationOp::create(
-      rewriter, ctx.loc, stackedTotalTypes, ctx.scanInputs, ctx.inShardings,
+  mlir::SmallVector<mlir::Value> phaseOneInputs(ctx.scanInputs.begin(),
+                                                ctx.scanInputs.end());
+  mlir::SmallVector<mlir::sdy::TensorShardingAttr> phaseOneInShardings(
+      ctx.inShardings.begin(), ctx.inShardings.end());
+  if (ctx.needsScanPadding) {
+    phaseOneInputs.push_back(ctx.globalIdxTensor);
+    phaseOneInShardings.push_back(ctx.inShardings[0]);
+  }
+
+  auto phaseOneManualComp = mlir::sdy::ManualComputationOp::create(
+      rewriter, ctx.loc, stackedTotalTypes, phaseOneInputs, phaseOneInShardings,
       ctx.inShardings, ctx.manualAxes);
-  mlir::Block& phase1Block = phase1ManualComp.getBody().emplaceBlock();
+  mlir::Block& phaseOneBlock = phaseOneManualComp.getBody().emplaceBlock();
   for (int64_t i = 0; i < ctx.numInputs; ++i) {
-    phase1Block.addArgument(withDimSize(ctx.scanInputs[i].getType(),
-                                        ctx.scanDim, ctx.localScanSize),
-                            ctx.loc);
+    phaseOneBlock.addArgument(withDimSize(ctx.scanInputs[i].getType(),
+                                          ctx.scanDim, ctx.localScanSize),
+                              ctx.loc);
+  }
+  if (ctx.needsScanPadding) {
+    phaseOneBlock.addArgument(ctx.localIdxType, ctx.loc);
   }
 
   mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(&phase1Block);
+  rewriter.setInsertionPointToStart(&phaseOneBlock);
 
   mlir::SmallVector<mlir::Value> restInputs;
   mlir::SmallVector<mlir::Value> localInits;
@@ -849,7 +1033,7 @@ mlir::sdy::ManualComputationOp buildLocalScanReduction(
   int64_t restLimit = ctx.isReverse ? ctx.localScanSize - 1 : ctx.localScanSize;
 
   for (int64_t i = 0; i < ctx.numInputs; ++i) {
-    mlir::Value localIn = phase1Block.getArgument(i);
+    mlir::Value localIn = phaseOneBlock.getArgument(i);
     mlir::Value initSlice =
         createSliceAlongDim(rewriter, ctx.loc, localIn, ctx.scanDim, initStart,
                             initLimit, ctx.scanReplicatedInShardings[i]);
@@ -860,9 +1044,11 @@ mlir::sdy::ManualComputationOp buildLocalScanReduction(
                                              ctx.scanReplicatedInShardings[i]));
   }
 
+  std::optional<ScanMaskOperands> mask = maybeCreatePhaseOneMask(
+      ctx, phaseOneBlock, initStart, initLimit, restStart, restLimit, rewriter);
   mhlo::ScanOp localScan = createScanWithClonedBody(
       ctx.scan, restInputs, localInits, ctx.scanReplicatedInShardings,
-      ctx.innerCarryShardings, rewriter);
+      ctx.innerCarryShardings, mask, rewriter);
 
   mlir::SmallVector<mlir::Value> localTotals;
   localTotals.reserve(ctx.numInputs);
@@ -872,7 +1058,7 @@ mlir::sdy::ManualComputationOp buildLocalScanReduction(
         ctx.scanReplicatedInShardings[i]));
   }
   mlir::sdy::ReturnOp::create(rewriter, ctx.loc, localTotals);
-  return phase1ManualComp;
+  return phaseOneManualComp;
 }
 
 // Phase 2: All-gathers per-shard totals along `scanDim`, runs a length-`P`
@@ -892,7 +1078,7 @@ CrossShardPrefixScanResult buildCrossShardPrefixScan(
   CrossShardPrefixScanResult result;
   result.prefixScan = createScanWithClonedBody(
       ctx.scan, gatheredTotals, ctx.inits, ctx.scanReplicatedInShardings,
-      ctx.carryShardings, rewriter);
+      ctx.carryShardings, /*mask=*/std::nullopt, rewriter);
 
   result.shardedIncs.reserve(ctx.numInputs);
   int64_t prefStart = ctx.isReverse ? 1 : 0;
@@ -920,54 +1106,108 @@ CrossShardPrefixScanResult buildCrossShardPrefixScan(
   return result;
 }
 
+// If `ctx.needsScanPadding` is true, creates the Phase 3 zero index init and
+// packages the local index argument for masking.
+std::optional<ScanMaskOperands> maybeCreatePhaseThreeMask(
+    const ScanLoweringContext& ctx, mlir::Block& phaseThreeBlock,
+    mlir::IRRewriter& rewriter) {
+  if (!ctx.needsScanPadding) {
+    return std::nullopt;
+  }
+  mlir::Value localIdx = phaseThreeBlock.getArgument(2 * ctx.numInputs);
+  mlir::RankedTensorType idxSliceType = eraseDim(
+      llvm::cast<mlir::RankedTensorType>(ctx.localIdxType), ctx.scanDim);
+  auto scalarI32Type = mlir::RankedTensorType::get({}, rewriter.getI32Type());
+  auto zeroConst = mlir::stablehlo::ConstantOp::create(
+      rewriter, ctx.loc, mlir::DenseIntElementsAttr::get(scalarI32Type, {0}));
+  auto zeroIdxInit = mlir::stablehlo::BroadcastInDimOp::create(
+      rewriter, ctx.loc, idxSliceType, zeroConst,
+      rewriter.getDenseI64ArrayAttr({}));
+  mlir::sdy::setShardings(zeroIdxInit, ctx.innerCarryShardings[0]);
+  return ScanMaskOperands{localIdx, zeroIdxInit.getResult(),
+                          ctx.globalScanSize};
+}
+
 // Phase 3: Emits the final per-shard scan via `sdy.manual_computation`, using
 // each shard's exclusive incoming carry from `shardedIncs` as its initial
 // state.
 mlir::sdy::ManualComputationOp buildFinalLocalScan(
     const ScanLoweringContext& ctx, mlir::ValueRange shardedIncs,
     mlir::IRRewriter& rewriter) {
-  mlir::SmallVector<mlir::Value> phase3Inputs;
-  mlir::SmallVector<mlir::sdy::TensorShardingAttr> phase3InShardings;
-  phase3Inputs.reserve(2 * ctx.numInputs);
-  phase3InShardings.reserve(2 * ctx.numInputs);
-  phase3Inputs.append(ctx.scanInputs.begin(), ctx.scanInputs.end());
-  phase3Inputs.append(shardedIncs.begin(), shardedIncs.end());
-  phase3InShardings.append(ctx.inShardings.begin(), ctx.inShardings.end());
-  phase3InShardings.append(ctx.inShardings.begin(), ctx.inShardings.end());
+  mlir::SmallVector<mlir::Value> phaseThreeInputs;
+  mlir::SmallVector<mlir::sdy::TensorShardingAttr> phaseThreeInShardings;
+  phaseThreeInputs.reserve(2 * ctx.numInputs + (ctx.needsScanPadding ? 1 : 0));
+  phaseThreeInShardings.reserve(2 * ctx.numInputs +
+                                (ctx.needsScanPadding ? 1 : 0));
+  phaseThreeInputs.append(ctx.scanInputs.begin(), ctx.scanInputs.end());
+  phaseThreeInputs.append(shardedIncs.begin(), shardedIncs.end());
+  phaseThreeInShardings.append(ctx.inShardings.begin(), ctx.inShardings.end());
+  phaseThreeInShardings.append(ctx.inShardings.begin(), ctx.inShardings.end());
+  if (ctx.needsScanPadding) {
+    phaseThreeInputs.push_back(ctx.globalIdxTensor);
+    phaseThreeInShardings.push_back(ctx.inShardings[0]);
+  }
 
-  auto phase3ManualComp = mlir::sdy::ManualComputationOp::create(
-      rewriter, ctx.loc, ctx.scanInputs.getTypes(), phase3Inputs,
-      phase3InShardings, ctx.outShardings, ctx.manualAxes);
-  mlir::Block& phase3Block = phase3ManualComp.getBody().emplaceBlock();
+  auto phaseThreeManualComp = mlir::sdy::ManualComputationOp::create(
+      rewriter, ctx.loc, mlir::ValueRange(ctx.scanInputs).getTypes(),
+      phaseThreeInputs, phaseThreeInShardings, ctx.outShardings,
+      ctx.manualAxes);
+  mlir::Block& phaseThreeBlock = phaseThreeManualComp.getBody().emplaceBlock();
   for (int64_t i = 0; i < ctx.numInputs; ++i) {
-    phase3Block.addArgument(withDimSize(ctx.scanInputs[i].getType(),
-                                        ctx.scanDim, ctx.localScanSize),
-                            ctx.loc);
+    phaseThreeBlock.addArgument(withDimSize(ctx.scanInputs[i].getType(),
+                                            ctx.scanDim, ctx.localScanSize),
+                                ctx.loc);
   }
   for (int64_t i = 0; i < ctx.numInputs; ++i) {
-    phase3Block.addArgument(
+    phaseThreeBlock.addArgument(
         withDimSize(ctx.scanInputs[i].getType(), ctx.scanDim, 1), ctx.loc);
+  }
+  if (ctx.needsScanPadding) {
+    phaseThreeBlock.addArgument(ctx.localIdxType, ctx.loc);
   }
 
   mlir::OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPointToStart(&phase3Block);
+  rewriter.setInsertionPointToStart(&phaseThreeBlock);
 
   mlir::SmallVector<mlir::Value> finalLocalInputs;
   mlir::SmallVector<mlir::Value> finalLocalInits;
   finalLocalInputs.reserve(ctx.numInputs);
   finalLocalInits.reserve(ctx.numInputs);
   for (int64_t i = 0; i < ctx.numInputs; ++i) {
-    finalLocalInputs.push_back(phase3Block.getArgument(i));
+    finalLocalInputs.push_back(phaseThreeBlock.getArgument(i));
     finalLocalInits.push_back(collapseSingleSliceToCarry(
-        rewriter, ctx.loc, phase3Block.getArgument(ctx.numInputs + i),
+        rewriter, ctx.loc, phaseThreeBlock.getArgument(ctx.numInputs + i),
         ctx.scanDim, ctx.innerCarryShardings[i]));
   }
 
+  std::optional<ScanMaskOperands> mask =
+      maybeCreatePhaseThreeMask(ctx, phaseThreeBlock, rewriter);
   mhlo::ScanOp finalScan = createScanWithClonedBody(
       ctx.scan, finalLocalInputs, finalLocalInits,
-      ctx.scanReplicatedOutShardings, ctx.innerCarryShardings, rewriter);
-  mlir::sdy::ReturnOp::create(rewriter, ctx.loc, finalScan.getOutputs());
-  return phase3ManualComp;
+      ctx.scanReplicatedOutShardings, ctx.innerCarryShardings, mask, rewriter);
+  mlir::sdy::ReturnOp::create(rewriter, ctx.loc,
+                              finalScan.getOutputs().take_front(ctx.numInputs));
+  return phaseThreeManualComp;
+}
+
+// Slices Phase 3 outputs back to the original unpadded output shapes when
+// `ctx.needsScanPadding` is true.
+mlir::SmallVector<mlir::Value> maybeUnpadScanOutputs(
+    const ScanLoweringContext& ctx, mlir::ValueRange phaseThreeOutputs,
+    mlir::IRRewriter& rewriter) {
+  mlir::ValueRange origOutputs = mhlo::ScanOp(ctx.scan).getOutputs();
+  mlir::SmallVector<mlir::Value> outputs;
+  outputs.reserve(ctx.numInputs);
+  for (int64_t i = 0; i < ctx.numInputs; ++i) {
+    mlir::Value outVal = phaseThreeOutputs[i];
+    if (ctx.needsScanPadding) {
+      outVal = mlir::sdy::sliceHighSideToType(rewriter, ctx.loc, outVal,
+                                              origOutputs[i].getType(),
+                                              ctx.outShardings[i]);
+    }
+    outputs.push_back(outVal);
+  }
+  return outputs;
 }
 
 struct ScanPartitioningOpInterface
@@ -995,22 +1235,33 @@ struct ScanPartitioningOpInterface
     mlir::sdy::ManualComputationOp phaseThreeManualComp =
         buildFinalLocalScan(*scanContext, prefixResult.shardedIncs, rewriter);
 
-    mlir::SmallVector<mlir::Value> replacements;
-    replacements.reserve(2 * scanContext->numInputs);
-    replacements.append(phaseThreeManualComp.result_begin(),
-                        phaseThreeManualComp.result_end());
+    mlir::SmallVector<mlir::Value> replacements = maybeUnpadScanOutputs(
+        *scanContext, phaseThreeManualComp.getResults(), rewriter);
     mlir::ValueRange globalCarries = prefixResult.prefixScan.getCarries();
     replacements.append(globalCarries.begin(), globalCarries.end());
     rewriter.replaceOp(scan, replacements);
     return mlir::success();
   }
 
-  // TODO(b/537364058): Support padForDivisibility for indivisible dimensions.
+  // Rebuilds `mhlo.scan` when non-scan dimensions are padded for divisibility.
+  // Because `sdy-resolve-permutation-factors` runs before
+  // `sdy-pad-for-divisibility`, any sharded scan dimension has already been
+  // lowered into the 3-phase scan or replicated.
+  std::optional<mlir::LogicalResult> padForDivisibility(
+      mlir::Operation* op, mlir::ValueRange operands,
+      mlir::ConversionPatternRewriter& rewriter,
+      const mlir::TypeConverter& typeConverter,
+      const mlir::SymbolTable& /*symbolTable*/) const {
+    return rebuildScanWithUpdatedOperandsAndResultTypes(
+        llvm::cast<mhlo::ScanOp>(op), operands, typeConverter,
+        /*dropShardingRule=*/false, rewriter);
+  }
+
   std::optional<mlir::LogicalResult> convertGlobalToLocal(
       mlir::Operation* op, mlir::ValueRange operands,
       mlir::ConversionPatternRewriter& rewriter,
       const mlir::TypeConverter& typeConverter,
-      const mlir::SymbolTable& symbolTable) const {
+      const mlir::SymbolTable& /*symbolTable*/) const {
     auto scan = llvm::cast<mhlo::ScanOp>(op);
     if (isScanDimSharded(scan)) {
       return scan.emitOpError(
@@ -1018,7 +1269,7 @@ struct ScanPartitioningOpInterface
           "conversion");
     }
     return rebuildScanWithUpdatedOperandsAndResultTypes(
-        scan, operands, typeConverter, rewriter);
+        scan, operands, typeConverter, /*dropShardingRule=*/true, rewriter);
   }
 };
 

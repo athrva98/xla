@@ -5324,6 +5324,34 @@ TEST_F(HloVerifierTest, VerifyBuffersBufferInResultMultipleTimes) {
               HasSubstr("buffer is used in results multiple times"));
 }
 
+TEST_F(HloVerifierTest, VerifyBuffersSameBufferInOperandsMultipleTimes) {
+  // The same buffer value is passed as two operands that alias two different
+  // results, so it is written twice by `writer`.
+  const char* const hlo = R"(
+  HloModule module
+
+  ENTRY computation {
+    p0 = f32[32] parameter(0)
+    b = b(f32[32]) custom-call(p0), custom_call_target="Pin",
+      output_to_operand_aliasing={{}:(0, {})}
+    writer = (b(f32[32]), b(f32[32])) custom-call(b, b),
+      custom_call_target="writer",
+      output_to_operand_aliasing={{0}: (0, {}), {1}: (1, {})}
+    b0 = b(f32[32]) get-tuple-element(writer), index=0
+    b1 = b(f32[32]) get-tuple-element(writer), index=1
+    v0 = f32[32] custom-call(b0), custom_call_target="Unpin",
+      output_to_operand_aliasing={{}:(0, {})}
+    v1 = f32[32] custom-call(b1), custom_call_target="Unpin",
+      output_to_operand_aliasing={{}:(0, {})}
+    ROOT t = (f32[32], f32[32]) tuple(v0, v1)
+  })";
+
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnUnverifiedModule(hlo));
+  auto status = verifier().Run(module.get()).status();
+  ASSERT_FALSE(status.ok());
+  EXPECT_THAT(status.message(), HasSubstr("has more than one writers"));
+}
+
 TEST_F(HloVerifierTest, VerifyBuffersBufferWithTwoWritesStraightLine) {
   const char* const hlo = R"(
   HloModule module

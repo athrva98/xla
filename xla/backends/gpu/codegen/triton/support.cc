@@ -816,10 +816,11 @@ CodegenDecision IsTritonSupportedConcatenate(const HloInstruction& hlo) {
   // Triton emitter requires concatenate operands to be aligned to the tile size
   // to avoid tiles straddling operand boundaries. Since we don't know the
   // concrete tile size yet, we enforce divisibility by a minimum reasonable
-  // tile size (64).
+  // tile size (8 for block-level fusions; GemmFusion and PriorityFusion enforce
+  // 64).
   // The last operand does not need to satisfy this constraint.
   int concatenate_dimension = hlo.concatenate_dimension();
-  constexpr int kMinConcatFragmentSize = 64;
+  constexpr int kMinConcatFragmentSize = 8;
   for (int i = 0; i < hlo.operand_count() - 1; ++i) {
     if (hlo.operand(i)->shape().dimensions(concatenate_dimension) %
             kMinConcatFragmentSize !=

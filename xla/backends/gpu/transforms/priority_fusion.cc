@@ -210,6 +210,22 @@ tsl::Executor* absl_nullable TilingSearchExecutor(
   return thread_pool->AsExecutor();
 }
 
+// In PriorityFusion, concatenate operands must be aligned to a minimum tile
+// size (64) to avoid an expensive tiling search that cannot tile across
+// unaligned boundaries.
+bool IsTritonSupportedConcatenateForPriorityFusion(const HloInstruction& hlo) {
+  constexpr int64_t kMinConcatFragmentSize = 64;
+  const int64_t concatenate_dimension = hlo.concatenate_dimension();
+  // The last operand does not need to be aligned.
+  return absl::c_all_of(
+      absl::MakeConstSpan(hlo.operands()).first(hlo.operand_count() - 1),
+      [&](const HloInstruction* operand) {
+        return operand->shape().dimensions(concatenate_dimension) %
+                   kMinConcatFragmentSize ==
+               0;
+      });
+}
+
 // An implementation of FusionQueue that determines whether to fuse instructions
 // according to a cost model, and chooses the next fusion candidate according to
 // dynamically updated priorities. The elements in the queue are producer nodes
@@ -798,17 +814,24 @@ class PriorityFusionQueue {
       return FusionDecision::Allow();
     }
 
-    if (instruction.opcode() != HloOpcode::kFusion) {
+    auto is_supported = [&](const HloInstruction& instr) -> CodegenDecision {
+      if (instr.opcode() == HloOpcode::kConcatenate &&
+          !IsTritonSupportedConcatenateForPriorityFusion(instr)) {
+        return CodegenDecision::Forbid(
+            "Concatenate operand is not aligned for tiling in PriorityFusion.");
+      }
       return IsTritonSupportedInstruction(
-          instruction, device_info_->gpu_compute_capability());
+          instr, device_info_->gpu_compute_capability());
+    };
+
+    if (instruction.opcode() != HloOpcode::kFusion) {
+      return is_supported(instruction);
     }
 
-    for (const HloInstruction* instruction :
+    for (const HloInstruction* instr :
          instruction.fused_instructions_computation()->instructions()) {
-      if (auto codegen_decision = IsTritonSupportedInstruction(
-              *instruction, device_info_->gpu_compute_capability());
-          !codegen_decision) {
-        return codegen_decision;
+      if (CodegenDecision decision = is_supported(*instr); !decision) {
+        return decision;
       }
     }
 

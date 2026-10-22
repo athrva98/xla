@@ -454,6 +454,8 @@ Build(
     # the Windows CI container image includes the lld/COFF/Driver.cpp
     # LinkerDriver::enqueuePath fix (b/571437556).
     command_retries=2,
+    use_bazel_diff=True,
+    bazel_diff_use_cquery=True,
 )
 
 Build(
@@ -554,6 +556,8 @@ Build(
     test_tag_filters=oneapi_test_tag_filter,
     options={**_DEFAULT_BAZEL_OPTIONS, "//xla/tsl:ci_build": True},
     subcommand="build",
+    use_bazel_diff=True,
+    bazel_diff_use_cquery=True,
 )
 
 # ROCm builds - hermetic LLVM
@@ -597,6 +601,8 @@ Build(
     test_tag_filters=rocm_tag_filter,
     options={**_DEFAULT_BAZEL_OPTIONS, "//xla/tsl:ci_build": True},
     subcommand="build",
+    use_bazel_diff=True,
+    bazel_diff_use_cquery=True,
 )
 
 Build(

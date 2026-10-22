@@ -1174,10 +1174,17 @@ std::vector<HloComputation*> HloComputation::MakeEmbeddedComputationsList()
       std::pair<HloComputation*, InstructionList::const_iterator>;
   std::stack<ComputationIter, absl::InlinedVector<ComputationIter, 8>> st;
 
+  if (!HasCalledComputations()) {
+    return {};
+  }
   // We cannot directly push (this, instructions_.cbegin()) to the stack, as the
   // stack should contain only mutable computations. Also, we don't want to
   // include the computation itself in the list of embedded computations.
   for (const HloInstructionInfo& instruction : instructions_with_info()) {
+    if (!HloInstruction::MightHaveCalledComputations(instruction.opcode())) {
+      DCHECK(instruction->called_computations().empty());
+      continue;
+    }
     using PtrVec = PtrVec<HloComputation*>;
     auto process_called_computations = [&](const PtrVec& called_computations) {
       if (called_computations.empty()) {
@@ -1194,7 +1201,9 @@ std::vector<HloComputation*> HloComputation::MakeEmbeddedComputationsList()
         HloComputation* called_computation = *i;
         if (visited.insert(called_computation).second) {
           st.emplace(called_computation,
-                     called_computation->instructions_.cbegin());
+                     called_computation->HasCalledComputations()
+                         ? called_computation->instructions_.cbegin()
+                         : called_computation->instructions_.cend());
         }
       }
     };

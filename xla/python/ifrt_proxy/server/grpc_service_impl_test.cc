@@ -31,6 +31,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/server.h"
@@ -156,6 +157,90 @@ TEST(GrpcServiceImplDeathTest, SessionTeardownTimeoutCrashesProcess) {
   EXPECT_DEATH(RunSessionWhoseTeardownOutlastsTimeout(),
                "Teardown of IFRT session 1 did not finish within 1s; crashing "
                "so that the server can be restarted");
+}
+
+// A backend factory that blocks, as the Pathways one does until its device set
+// is placed, until `release` is notified or `max_wait` passed.
+GrpcServiceImpl::BackendFactory BlockingBackendFactory(
+    absl::Notification& started, absl::Notification& release,
+    absl::Duration max_wait, std::function<void()> on_destroy) {
+  return [&started, &release, max_wait, on_destroy = std::move(on_destroy)](
+             IfrtProxyVersion version, uint64_t session_id,
+             std::shared_ptr<HostBufferStore> host_buffer_store,
+             AttributeMap initialization_data)
+             -> absl::StatusOr<std::unique_ptr<BackendInterface>> {
+    started.Notify();
+    release.WaitForNotificationWithTimeout(max_wait);
+    return std::make_unique<FakeBackend>(on_destroy);
+  };
+}
+
+// Opens a session on `service` and cancels it, as a client that dies does,
+// once the service is creating the session's backend.
+class SessionLeftDuringCreation {
+ public:
+  SessionLeftDuringCreation(GrpcServiceImpl& service,
+                            absl::Notification& creation_started) {
+    ::grpc::ServerBuilder builder;
+    builder.RegisterService(&service);
+    server_ = builder.BuildAndStart();
+    stub_ = grpc::GrpcIfrtService::NewStub(
+        server_->InProcessChannel(::grpc::ChannelArguments()));
+    GrpcIfrtSessionMetadata metadata;
+    *metadata.mutable_version() = Version();
+    context_.AddMetadata("ifrt-proxy-grpc-ifrt-session-metadata-bin",
+                         metadata.SerializeAsString());
+    stream_ = stub_->IfrtSession(&context_);
+    creation_started.WaitForNotification();
+    context_.TryCancel();
+    (void)stream_->Finish();
+  }
+
+ private:
+  std::unique_ptr<::grpc::Server> server_;
+  std::unique_ptr<grpc::GrpcIfrtService::Stub> stub_;
+  ::grpc::ClientContext context_;
+  std::unique_ptr<::grpc::ClientReaderWriter<IfrtRequest, IfrtResponse>>
+      stream_;
+};
+
+TEST(GrpcServiceImplTest, CreationEndingWithinTimeoutAfterClientLeftTearsDown) {
+  absl::Notification creation_started;
+  absl::Notification release_creation;
+  absl::Notification torn_down;
+  GrpcServiceImpl::Options options;
+  options.session_teardown_timeout = absl::Seconds(5);
+  GrpcServiceImpl service(
+      BlockingBackendFactory(creation_started, release_creation,
+                             absl::Seconds(30), [&] { torn_down.Notify(); }),
+      std::move(options));
+
+  SessionLeftDuringCreation session(service, creation_started);
+  // Long enough for the service to see that the client left.
+  absl::SleepFor(absl::Seconds(1));
+  release_creation.Notify();
+  EXPECT_TRUE(torn_down.WaitForNotificationWithTimeout(absl::Seconds(10)));
+}
+
+void RunSessionWhoseClientLeavesDuringEndlessCreation() {
+  absl::Notification creation_started;
+  absl::Notification never_notified;
+  GrpcServiceImpl::Options options;
+  options.session_teardown_timeout = absl::Seconds(1);
+  GrpcServiceImpl service(
+      BlockingBackendFactory(creation_started, never_notified,
+                             absl::Seconds(30), [] {}),
+      std::move(options));
+  SessionLeftDuringCreation session(service, creation_started);
+  absl::SleepFor(absl::Seconds(30));
+}
+
+TEST(GrpcServiceImplDeathTest, CreationOutlivingDepartedClientCrashesProcess) {
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  EXPECT_DEATH(RunSessionWhoseClientLeavesDuringEndlessCreation(),
+               "Creating the backend of IFRT session 1 did not finish within "
+               "1s after its client left; crashing so that the server can be "
+               "restarted");
 }
 
 class GrpcIfrtServiceImplHostBufferTest
